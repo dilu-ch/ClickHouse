@@ -108,9 +108,9 @@ void ITableFunction::checkAccessToCreateTableTarget(const ASTPtr & table_functio
     if (!factory.isTableFunctionName(name))
         return;
 
-    /// The same veto as for the outermost function of a definition, see `InterpreterCreateQuery`.
+    /// The same vetoes as for the outermost function of a definition, see `InterpreterCreateQuery`.
     const auto unparsed = factory.tryGet(name, context);
-    if (unparsed->dependsOnCurrentUserGrants())
+    if (unparsed->dependsOnCurrentUserGrants() || !unparsed->canBeUsedToCreateTable())
         throw Exception(
             ErrorCodes::BAD_ARGUMENTS,
             "Table function '{}' cannot be used to create a table, neither directly nor nested in another table "
@@ -118,17 +118,15 @@ void ITableFunction::checkAccessToCreateTableTarget(const ASTPtr & table_functio
             name);
 
     /// A grant on a source is matched against the first argument, which names the source, or against an override of a
-    /// named collection, `url = ...`, so they must mean here what they mean where the query runs. The other arguments,
-    /// e.g. a sharding key, may vary.
+    /// named collection, `key = value` with any spelling of the key, so they must mean here what they mean where the
+    /// query runs. The other arguments, e.g. a sharding key, may vary.
     if (const auto & function = table_function_ast->as<ASTFunction &>(); function.arguments && unparsed->getSourceAccessObject())
     {
         const auto & arguments = function.arguments->children;
         for (size_t i = 0; i < arguments.size(); ++i)
         {
             const auto * assignment = arguments[i]->as<ASTFunction>();
-            const bool is_override = assignment && assignment->name == "equals" && assignment->arguments
-                && assignment->arguments->children.size() == 2 && assignment->arguments->children[0]->as<ASTIdentifier>();
-            if (i == 0 || is_override)
+            if (i == 0 || (assignment && assignment->name == "equals"))
                 throwIfValueVariesByContext(*arguments[i], context);
         }
     }

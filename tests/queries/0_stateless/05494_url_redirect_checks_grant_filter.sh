@@ -111,12 +111,13 @@ ${CLICKHOUSE_CLIENT} --user "$user_legacy" --distributed_ddl_entry_format_versio
 # The shards resolve a target nested in `remote` under the connection's user.
 ${CLICKHOUSE_CLIENT} --query "GRANT REMOTE ON *.* TO $user_filtered"
 check_missing_grant "$user_filtered" "CREATE TABLE t_as_function_denied AS remote('127.0.0.1', url('$redirector', 'LineAsString', 's String'))"
-check_missing_grant "$user_filtered" "CREATE TABLE t_as_function_denied AS remote('127.0.0.1', loop(url('$redirector', 'LineAsString', 's String')))"
+# `loop` cannot create a table, so it is vetoed at any depth before its target is looked at.
+${CLICKHOUSE_CLIENT} --user "$user_filtered" --query "CREATE TABLE t_as_function_denied AS remote('127.0.0.1', loop(url('$redirector', 'LineAsString', 's String')))" 2>&1 | grep -c -m1 "cannot be used to create a table"
 check_missing_grant "$user_filtered" "CREATE TABLE t_as_function_denied AS remote('127.0.0.1', view(SELECT * FROM url('$redirector', 'LineAsString', 's String')))"
 # A subquery in an argument of another table function reads the target too.
 check_missing_grant "$user_filtered" "CREATE TABLE t_as_function_denied (s String) AS remote('127.0.0.1:1', view(SELECT * FROM values('s String', (SELECT s FROM url('$redirector', 'LineAsString', 's String') LIMIT 1))))"
 check_missing_grant "$user_filtered" "CREATE TABLE t_as_function_denied (number UInt64) AS remote('127.0.0.1:1', view(SELECT * FROM numbers((SELECT length(s) FROM url('$redirector', 'LineAsString', 's String') LIMIT 1))))"
-check_missing_grant "$user_filtered" "CREATE TABLE t_as_function_denied (s String) AS remote('127.0.0.1:1', view(SELECT * FROM loop(values('s String', (SELECT s FROM url('$redirector', 'LineAsString', 's String') LIMIT 1)))))"
+${CLICKHOUSE_CLIENT} --user "$user_filtered" --query "CREATE TABLE t_as_function_denied (s String) AS remote('127.0.0.1:1', view(SELECT * FROM loop(values('s String', (SELECT s FROM url('$redirector', 'LineAsString', 's String') LIMIT 1)))))" 2>&1 | grep -c -m1 "cannot be used to create a table"
 ${CLICKHOUSE_CLIENT} --query "GRANT TABLE ENGINE ON Remote TO $user_filtered"
 check_missing_grant "$user_filtered" "CREATE TABLE t_as_function_denied (s String) ENGINE = Remote('127.0.0.1', url('$redirector', 'LineAsString', 's String'))"
 check_missing_grant "$user_filtered" "CREATE TABLE t_as_function_denied ON CLUSTER test_shard_localhost (s String) ENGINE = Remote('127.0.0.1', url('$redirector', 'LineAsString', 's String'))" --distributed_ddl_entry_format_version 2 --distributed_ddl_output_mode throw
@@ -176,14 +177,16 @@ ${CLICKHOUSE_CLIENT} --user "$user_filtered" --query "CREATE TABLE t_view_with_d
 ${CLICKHOUSE_CLIENT} --user "$user_filtered" --query "CREATE TABLE t_view_with_denied AS remote('127.0.0.1', view(WITH if(currentUser() = 'x', 'http://x', '$redirector') AS u SELECT * FROM url(u, 'LineAsString', 's String')))" 2>&1 | grep -c -m1 "depends on where the query runs"
 ${CLICKHOUSE_CLIENT} --user "$user_filtered" --query "CREATE TABLE t_view_with_denied AS remote('127.0.0.1', view(WITH '$redirector' AS u SELECT * FROM view(WITH 'http://localhost:${CLICKHOUSE_PORT_HTTP}/?query=SELECT+1' AS u SELECT * FROM url(u, 'LineAsString', 's String'))))" 2>&1 | grep -c -m1 "Not enough privileges"
 ${CLICKHOUSE_CLIENT} --user "$user_filtered" --query "CREATE TABLE t_view_with_denied AS remote('127.0.0.1', view(SELECT 'http://x' AS u FROM url(u, 'LineAsString', 's String')))" 2>&1 | grep -c -m1 "Not enough privileges"
-# A nested target keeps the fail-closes of a read: the cluster user of `urlCluster`, and a wildcard from index pages.
-check_missing_grant "$user_filtered" "CREATE TABLE t_as_function_denied AS remote('127.0.0.1', urlCluster('test_shard_localhost', '$redirector', 'LineAsString', 's String'))"
+# A nested target keeps the fail-closes of a read: a function that cannot create a table, such as `urlCluster`, is
+# vetoed at any depth, and a wildcard from index pages needs the grant on the whole source.
+${CLICKHOUSE_CLIENT} --user "$user_filtered" --query "CREATE TABLE t_as_function_denied AS remote('127.0.0.1', urlCluster('test_shard_localhost', '$redirector', 'LineAsString', 's String'))" 2>&1 | grep -c -m1 "cannot be used to create a table"
 check_missing_grant "$user_filtered" "CREATE TABLE t_as_function_denied AS remote('127.0.0.1', url('http://localhost:${CLICKHOUSE_PORT_HTTP}/upyachka*', 'RawBLOB', 's String'))" --allow_url_wildcard_from_index_pages 1
 # A source that differs where the definition is loaded is refused for the outermost function too, and nested
 # views are checked once each.
 ${CLICKHOUSE_CLIENT} --query "CREATE TABLE t_view_with_denied (s String) AS url(if(currentUser() = 'x', 's3://b/k', '$redirector'), 'LineAsString', 's String')" 2>&1 | grep -c -m1 "depends on where the query runs"
 ${CLICKHOUSE_CLIENT} --query "CREATE NAMED COLLECTION nc_05494_${CLICKHOUSE_DATABASE} AS url = '$redirector'"
 ${CLICKHOUSE_CLIENT} --query "CREATE TABLE t_view_with_denied (s String) AS url(nc_05494_${CLICKHOUSE_DATABASE}, url = if(currentUser() = 'x', 's3://b/k', '$redirector'), format = 'LineAsString', structure = 's String')" 2>&1 | grep -c -m1 "depends on where the query runs"
+${CLICKHOUSE_CLIENT} --query "CREATE TABLE t_view_with_denied (s String) AS url(nc_05494_${CLICKHOUSE_DATABASE}, concat('u', 'rl') = if(currentUser() = 'x', 's3://b/k', '$redirector'), format = 'LineAsString', structure = 's String')" 2>&1 | grep -c -m1 "depends on where the query runs"
 ${CLICKHOUSE_CLIENT} --query "DROP NAMED COLLECTION nc_05494_${CLICKHOUSE_DATABASE}"
 # A relative URL is resolved against `url_base` where the query runs.
 ${CLICKHOUSE_CLIENT} --url_base "http://localhost:${CLICKHOUSE_PORT_HTTP}/" --query "CREATE TABLE t_view_with_denied (s String) AS remote('127.0.0.1:1', view(SELECT * FROM (SELECT * FROM url('upyachka', 'LineAsString', 's String') SETTINGS url_base = 'http://localhost:${CLICKHOUSE_PORT_HTTP}/')))" 2>&1 | grep -c -m1 "resolved against"
@@ -193,6 +196,7 @@ ${CLICKHOUSE_CLIENT} --query "CREATE TABLE t_view_deep (number UInt64) AS remote
 ${CLICKHOUSE_CLIENT} --query "EXISTS TABLE t_view_deep"
 # The veto of a function that the reader's grants resolve holds at any depth.
 ${CLICKHOUSE_CLIENT} --user "$user_filtered" --query "CREATE TABLE t_view_with_denied (x UInt8) AS remote('127.0.0.1:1', view(SELECT * FROM viewIfPermitted(SELECT 1 AS x ELSE null('x UInt8'))))" 2>&1 | grep -c -m1 "cannot be used to create a table"
+${CLICKHOUSE_CLIENT} --user "$user_filtered" --query "CREATE TABLE t_view_with_denied (x UInt8) AS remote('127.0.0.1:1', view(SELECT * FROM eval('SELECT 1 AS x')))" 2>&1 | grep -c -m1 "cannot be used to create a table"
 
 ${CLICKHOUSE_CLIENT} --query "DROP TABLE t_redirect"
 ${CLICKHOUSE_CLIENT} --query "DROP TABLE t_redirect_inferred"
