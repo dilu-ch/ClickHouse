@@ -28,6 +28,7 @@
 #include <Storages/IStorage.h>
 #include <Storages/StorageDistributed.h>
 #include <Storages/StorageFactory.h>
+#include <TableFunctions/ITableFunction.h>
 #include <TableFunctions/TableFunctionFactory.h>
 #include <Common/FailPoint.h>
 #include <Common/NamedCollections/NamedCollectionsBackup.h>
@@ -526,7 +527,7 @@ void RestorerFromBackup::checkAccessForObjectsFoundInBackup() const
                             && restore_settings.core_settings.tryGet("restore_replace_external_table_functions_to_null") != nullptr
                             && !(properties && properties->allow_readonly);
                         if (!hosts_replace_by_null)
-                            factory.get(create.as_table_function->ptr(), context)->checkAccessToCreateTable(context);
+                            ITableFunction::checkAccessToCreateTableTarget(create.as_table_function->ptr(), context);
                     }
                     if (!hosts_replace_external_engines_to_null)
                         checkAccessToCreateRemoteTableTarget(create, context);

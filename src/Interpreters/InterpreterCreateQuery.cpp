@@ -112,6 +112,7 @@
 #include <Interpreters/FunctionNameNormalizer.h>
 #include <Interpreters/ApplyWithSubqueryVisitor.h>
 
+#include <TableFunctions/ITableFunction.h>
 #include <TableFunctions/TableFunctionFactory.h>
 #include <Common/NamedCollections/NamedCollectionsFactory.h>
 
@@ -1371,7 +1372,7 @@ InterpreterCreateQuery::TableProperties InterpreterCreateQuery::getTableProperti
         throwIfTableFunctionCannotBeUsedToCreateTable(table_function_ast, *table_function, getContext());
         /// A `RESTORE` introduces the definition under the restoring user, like `ENGINE = URL` treats it.
         if (!isReplayedTableDefinition(mode, create, getContext()) || is_restore_from_backup)
-            table_function->checkAccessToCreateTable(getContext());
+            ITableFunction::checkAccessToCreateTableTarget(table_function_ast, getContext());
 
         /// Classify the table function before inferring the structure from it: the inference opens and
         /// reads the source, which would turn a deterministic rejection into a file or access error.
@@ -2995,7 +2996,7 @@ bool InterpreterCreateQuery::doCreateTable(ASTCreateQuery & create,
         /// is checked here.
         throwIfTableFunctionCannotBeUsedToCreateTable(table_function_ast, *table_function, getContext());
         if (!isReplayedTableDefinition(mode, create, getContext()) || is_restore_from_backup)
-            table_function->checkAccessToCreateTable(getContext());
+            ITableFunction::checkAccessToCreateTableTarget(table_function_ast, getContext());
 
         /// Classify the table function before executing it: with a static structure it returns the final storage
         /// directly, which may not have enough information to decide (e.g. `url` with a relative URL resolved
@@ -4207,7 +4208,7 @@ BlockIO InterpreterCreateQuery::execute()
                     auto table_function_ast = query.as_table_function->ptr();
                     auto table_function = TableFunctionFactory::instance().get(table_function_ast, getContext());
                     throwIfTableFunctionCannotBeUsedToCreateTable(table_function_ast, *table_function, getContext());
-                    table_function->checkAccessToCreateTable(getContext());
+                    ITableFunction::checkAccessToCreateTableTarget(table_function_ast, getContext());
                     table_function->checkAccessToExecute(
                         getContext(), /*is_insert_query=*/ true, /*check_create_temporary_table=*/ true, /*check_source_access=*/ true);
                 }

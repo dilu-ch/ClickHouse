@@ -178,11 +178,18 @@ ${CLICKHOUSE_CLIENT} --user "$user_filtered" --query "CREATE TABLE t_view_with_d
 # A nested target keeps the fail-closes of a read: the cluster user of `urlCluster`, and a wildcard from index pages.
 check_missing_grant "$user_filtered" "CREATE TABLE t_as_function_denied AS remote('127.0.0.1', urlCluster('test_shard_localhost', '$redirector', 'LineAsString', 's String'))"
 check_missing_grant "$user_filtered" "CREATE TABLE t_as_function_denied AS remote('127.0.0.1', url('http://localhost:${CLICKHOUSE_PORT_HTTP}/upyachka*', 'RawBLOB', 's String'))" --allow_url_wildcard_from_index_pages 1
+# A source that differs where the definition is loaded is refused for the outermost function too, and nested
+# views are checked once each.
+${CLICKHOUSE_CLIENT} --query "CREATE TABLE t_view_with_denied (s String) AS url(if(currentUser() = 'x', 's3://b/k', '$redirector'), 'LineAsString', 's String')" 2>&1 | grep -c -m1 "depends on where the query runs"
+deep="numbers(1)"
+for _ in $(seq 1 25); do deep="view(SELECT * FROM $deep)"; done
+${CLICKHOUSE_CLIENT} --query "CREATE TABLE t_view_deep (number UInt64) AS remote('127.0.0.1:1', $deep)"
+${CLICKHOUSE_CLIENT} --query "EXISTS TABLE t_view_deep"
 # The veto of a function that the reader's grants resolve holds at any depth.
 ${CLICKHOUSE_CLIENT} --user "$user_filtered" --query "CREATE TABLE t_view_with_denied (x UInt8) AS remote('127.0.0.1:1', view(SELECT * FROM viewIfPermitted(SELECT 1 AS x ELSE null('x UInt8'))))" 2>&1 | grep -c -m1 "cannot be used to create a table"
 
 ${CLICKHOUSE_CLIENT} --query "DROP TABLE t_redirect"
 ${CLICKHOUSE_CLIENT} --query "DROP TABLE t_redirect_inferred"
-${CLICKHOUSE_CLIENT} --query "DROP TABLE t_redirect_as_function, t_redirect_as_function_lazy, t_as_function_created, t_remote_src, t_restored, t_view_pv, t_view_with, t_view_nested, t_view_remote_only, t_view_with_filtered, t_view_with_chain, t_view_with_concat, t_view_sharding_key"
+${CLICKHOUSE_CLIENT} --query "DROP TABLE t_redirect_as_function, t_redirect_as_function_lazy, t_as_function_created, t_remote_src, t_restored, t_view_pv, t_view_with, t_view_nested, t_view_remote_only, t_view_with_filtered, t_view_with_chain, t_view_with_concat, t_view_sharding_key, t_view_deep"
 ${CLICKHOUSE_CLIENT} --query "DROP VIEW pv_05494"
 ${CLICKHOUSE_CLIENT} --query "DROP USER $user_filtered, $user_full, $user_engine, $user_table, $user_legacy"

@@ -109,15 +109,36 @@ namespace
         return result;
     }
 
-    /// The query is not analyzed: a carrier such as `remote` may run it where tables unknown here exist. The walk goes
-    /// on into the arguments of a table function, where a subquery may read a target the function itself knows nothing of.
+    void checkAccessToCreateTableTargets(const IAST & ast, const ContextPtr & context, BoundByAlias bound);
+
+    /// After the check of a table function, only what no hook covers is walked: a subquery in an argument may read a
+    /// target the function knows nothing of, while a nested table function or the query of a `view` have their own hook.
+    void walkArgumentsWithoutHook(const ASTFunction & function, const ContextPtr & context, const BoundByAlias & bound)
+    {
+        if (!function.arguments)
+            return;
+        for (const auto & argument : function.arguments->children)
+        {
+            if (argument->as<ASTSelectWithUnionQuery>())
+                continue;
+            if (const auto * nested = argument->as<ASTFunction>(); nested && TableFunctionFactory::instance().isTableFunctionName(nested->name))
+                continue;
+            checkAccessToCreateTableTargets(*argument, context, bound);
+        }
+    }
+
+    /// The query is not analyzed: a carrier such as `remote` may run it where tables unknown here exist.
     void checkAccessToCreateTableTargets(const IAST & ast, const ContextPtr & context, BoundByAlias bound)
     {
         if (const auto * select = ast.as<ASTSelectQuery>())
             collectAliases(*select, bound);
 
         if (const auto * table_expression = ast.as<ASTTableExpression>(); table_expression && table_expression->table_function)
+        {
             ITableFunction::checkAccessToCreateTableTarget(withAliasesSubstituted(table_expression->table_function, bound), context);
+            walkArgumentsWithoutHook(table_expression->table_function->as<ASTFunction &>(), context, bound);
+            return;
+        }
 
         for (const auto & child : ast.children)
             checkAccessToCreateTableTargets(*child, context, bound);
