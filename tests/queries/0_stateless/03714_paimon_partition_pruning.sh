@@ -9,11 +9,6 @@ CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
 . "$CURDIR"/../shell_config.sh
 
-# The queries assert EngineFileLikeReadFiles, so pin the metadata caches to their defaults against the
-# randomizer: caching parsed Paimon manifests (use_paimon_metadata_files_cache) or parquet footers
-# (use_parquet_metadata_cache) changes how many files each query reads.
-CLICKHOUSE_CLIENT="$CLICKHOUSE_CLIENT --use_paimon_metadata_files_cache=0 --use_parquet_metadata_cache=1"
-
 # test null
 $CLICKHOUSE_CLIENT --query_id="test_03714_1_$CLICKHOUSE_TEST_UNIQUE_NAME" --enable_time_time64_type=1 --session_timezone="UTC" --query "
 select f_boolean,
