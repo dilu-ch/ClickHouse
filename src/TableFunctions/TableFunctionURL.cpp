@@ -446,6 +446,10 @@ StoragePtr TableFunctionURL::getStorage(
 
 void TableFunctionURL::checkAccessToCreateTable(ContextPtr context) const
 {
+    /// A delegated scheme is the delegate's source and follows no HTTP redirect, so it is treated as `AS s3(...)` is.
+    if (delegate)
+        return;
+
     /// The table is read under the grants on the table, so its creator needs what `ENGINE = URL` needs: `TABLE ENGINE`,
     /// which no URL filter bounds, and `READ` on the URL itself even when a column list skips the schema inference.
     checkEngineAccess(context);
