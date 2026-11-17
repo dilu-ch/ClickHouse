@@ -1,6 +1,7 @@
 #include <Access/ContextAccess.h>
 #include <TableFunctions/ITableFunction.h>
 #include <Parsers/ASTFunction.h>
+#include <Parsers/ASTIdentifier.h>
 #include <Parsers/ASTSelectWithUnionQuery.h>
 #include <Parsers/ASTSubquery.h>
 #include <Functions/FunctionFactory.h>
@@ -116,11 +117,21 @@ void ITableFunction::checkAccessToCreateTableTarget(const ASTPtr & table_functio
             "function or in a table engine argument",
             name);
 
-    /// A grant on a source is matched against the first argument, which names the source, so it must mean here what it
-    /// means where the query runs. The other arguments, e.g. a sharding key, may vary.
-    if (const auto & function = table_function_ast->as<ASTFunction &>();
-        function.arguments && !function.arguments->children.empty() && unparsed->getSourceAccessObject())
-        throwIfValueVariesByContext(*function.arguments->children.front(), context);
+    /// A grant on a source is matched against the first argument, which names the source, or against an override of a
+    /// named collection, `url = ...`, so they must mean here what they mean where the query runs. The other arguments,
+    /// e.g. a sharding key, may vary.
+    if (const auto & function = table_function_ast->as<ASTFunction &>(); function.arguments && unparsed->getSourceAccessObject())
+    {
+        const auto & arguments = function.arguments->children;
+        for (size_t i = 0; i < arguments.size(); ++i)
+        {
+            const auto * assignment = arguments[i]->as<ASTFunction>();
+            const bool is_override = assignment && assignment->name == "equals" && assignment->arguments
+                && assignment->arguments->children.size() == 2 && assignment->arguments->children[0]->as<ASTIdentifier>();
+            if (i == 0 || is_override)
+                throwIfValueVariesByContext(*arguments[i], context);
+        }
+    }
 
     TableFunctionPtr table_function;
     try

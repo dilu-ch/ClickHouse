@@ -456,6 +456,12 @@ StoragePtr TableFunctionURL::getStorage(
 
 void TableFunctionURL::checkAccessToCreateTable(ContextPtr context) const
 {
+    if (is_relative_url)
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS,
+            "A relative URL of a table function persisted in a table is resolved against `url_base` where the query runs, "
+            "and cannot be checked: write the full URL");
+
     /// A delegated scheme is the delegate's source and follows no HTTP redirect, so it is treated as `AS s3(...)` is.
     if (delegate)
         return;

@@ -1370,9 +1370,6 @@ InterpreterCreateQuery::TableProperties InterpreterCreateQuery::getTableProperti
         auto table_function_ast = create.as_table_function->ptr();
         auto table_function = TableFunctionFactory::instance().get(table_function_ast, getContext());
         throwIfTableFunctionCannotBeUsedToCreateTable(table_function_ast, *table_function, getContext());
-        /// A `RESTORE` introduces the definition under the restoring user, like `ENGINE = URL` treats it.
-        if (!isReplayedTableDefinition(mode, create, getContext()) || is_restore_from_backup)
-            ITableFunction::checkAccessToCreateTableTarget(table_function_ast, getContext());
 
         /// Classify the table function before inferring the structure from it: the inference opens and
         /// reads the source, which would turn a deterministic rejection into a file or access error.
@@ -1381,6 +1378,10 @@ InterpreterCreateQuery::TableProperties InterpreterCreateQuery::getTableProperti
             && isOnlyReplicatedEngineAllowed(create, DatabaseCatalog::instance().tryGetDatabase(create.getDatabase()), getContext())
             && table_function->hasUnreplicatedTableDataOnDisk())
             throwUnreplicatedTableDataNotAllowed();
+
+        /// A `RESTORE` introduces the definition under the restoring user, like `ENGINE = URL` treats it.
+        if (!isReplayedTableDefinition(mode, create, getContext()) || is_restore_from_backup)
+            ITableFunction::checkAccessToCreateTableTarget(table_function_ast, getContext());
 
         properties.columns = table_function->getActualTableStructureWithAccess(getContext(), /*is_insert_query*/ true);
     }
@@ -2995,14 +2996,15 @@ bool InterpreterCreateQuery::doCreateTable(ASTCreateQuery & create,
         /// inferred from the function; a definition with an explicit column list skips that inference and
         /// is checked here.
         throwIfTableFunctionCannotBeUsedToCreateTable(table_function_ast, *table_function, getContext());
-        if (!isReplayedTableDefinition(mode, create, getContext()) || is_restore_from_backup)
-            ITableFunction::checkAccessToCreateTableTarget(table_function_ast, getContext());
 
         /// Classify the table function before executing it: with a static structure it returns the final storage
         /// directly, which may not have enough information to decide (e.g. `url` with a relative URL resolved
         /// against `url_base`), see `ITableFunction::hasUnreplicatedTableDataOnDisk`.
         if (only_replicated_engine_allowed && table_function->hasUnreplicatedTableDataOnDisk())
             throwUnreplicatedTableDataNotAllowed();
+
+        if (!isReplayedTableDefinition(mode, create, getContext()) || is_restore_from_backup)
+            ITableFunction::checkAccessToCreateTableTarget(table_function_ast, getContext());
 
         /// In case of CREATE AS table_function() query we should use global context
         /// in storage creation because there will be no query context on server startup

@@ -116,6 +116,7 @@ check_missing_grant "$user_filtered" "CREATE TABLE t_as_function_denied AS remot
 # A subquery in an argument of another table function reads the target too.
 check_missing_grant "$user_filtered" "CREATE TABLE t_as_function_denied (s String) AS remote('127.0.0.1:1', view(SELECT * FROM values('s String', (SELECT s FROM url('$redirector', 'LineAsString', 's String') LIMIT 1))))"
 check_missing_grant "$user_filtered" "CREATE TABLE t_as_function_denied (number UInt64) AS remote('127.0.0.1:1', view(SELECT * FROM numbers((SELECT length(s) FROM url('$redirector', 'LineAsString', 's String') LIMIT 1))))"
+check_missing_grant "$user_filtered" "CREATE TABLE t_as_function_denied (s String) AS remote('127.0.0.1:1', view(SELECT * FROM loop(values('s String', (SELECT s FROM url('$redirector', 'LineAsString', 's String') LIMIT 1)))))"
 ${CLICKHOUSE_CLIENT} --query "GRANT TABLE ENGINE ON Remote TO $user_filtered"
 check_missing_grant "$user_filtered" "CREATE TABLE t_as_function_denied (s String) ENGINE = Remote('127.0.0.1', url('$redirector', 'LineAsString', 's String'))"
 check_missing_grant "$user_filtered" "CREATE TABLE t_as_function_denied ON CLUSTER test_shard_localhost (s String) ENGINE = Remote('127.0.0.1', url('$redirector', 'LineAsString', 's String'))" --distributed_ddl_entry_format_version 2 --distributed_ddl_output_mode throw
@@ -181,6 +182,11 @@ check_missing_grant "$user_filtered" "CREATE TABLE t_as_function_denied AS remot
 # A source that differs where the definition is loaded is refused for the outermost function too, and nested
 # views are checked once each.
 ${CLICKHOUSE_CLIENT} --query "CREATE TABLE t_view_with_denied (s String) AS url(if(currentUser() = 'x', 's3://b/k', '$redirector'), 'LineAsString', 's String')" 2>&1 | grep -c -m1 "depends on where the query runs"
+${CLICKHOUSE_CLIENT} --query "CREATE NAMED COLLECTION nc_05494_${CLICKHOUSE_DATABASE} AS url = '$redirector'"
+${CLICKHOUSE_CLIENT} --query "CREATE TABLE t_view_with_denied (s String) AS url(nc_05494_${CLICKHOUSE_DATABASE}, url = if(currentUser() = 'x', 's3://b/k', '$redirector'), format = 'LineAsString', structure = 's String')" 2>&1 | grep -c -m1 "depends on where the query runs"
+${CLICKHOUSE_CLIENT} --query "DROP NAMED COLLECTION nc_05494_${CLICKHOUSE_DATABASE}"
+# A relative URL is resolved against `url_base` where the query runs.
+${CLICKHOUSE_CLIENT} --url_base "http://localhost:${CLICKHOUSE_PORT_HTTP}/" --query "CREATE TABLE t_view_with_denied (s String) AS remote('127.0.0.1:1', view(SELECT * FROM (SELECT * FROM url('upyachka', 'LineAsString', 's String') SETTINGS url_base = 'http://localhost:${CLICKHOUSE_PORT_HTTP}/')))" 2>&1 | grep -c -m1 "resolved against"
 deep="numbers(1)"
 for _ in $(seq 1 25); do deep="view(SELECT * FROM $deep)"; done
 ${CLICKHOUSE_CLIENT} --query "CREATE TABLE t_view_deep (number UInt64) AS remote('127.0.0.1:1', $deep)"

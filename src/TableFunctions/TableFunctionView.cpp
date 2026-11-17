@@ -10,6 +10,7 @@
 #include <Parsers/ASTSubquery.h>
 #include <Parsers/ASTTablesInSelectQuery.h>
 #include <Parsers/ASTWithAlias.h>
+#include <Poco/String.h>
 #include <Storages/StorageView.h>
 #include <TableFunctions/ITableFunction.h>
 #include <TableFunctions/TableFunctionFactory.h>
@@ -112,18 +113,21 @@ namespace
     void checkAccessToCreateTableTargets(const IAST & ast, const ContextPtr & context, BoundByAlias bound);
 
     /// After the check of a table function, only what no hook covers is walked: a subquery in an argument may read a
-    /// target the function knows nothing of, while a nested table function or the query of a `view` have their own hook.
+    /// target the function knows nothing of. A nested table function was checked by the carrier, so only its arguments
+    /// are walked in turn; the query of a `view` is walked by the hook of the view.
     void walkArgumentsWithoutHook(const ASTFunction & function, const ContextPtr & context, const BoundByAlias & bound)
     {
         if (!function.arguments)
             return;
+        const bool is_view = Poco::toLower(function.name) == TableFunctionView::name;
         for (const auto & argument : function.arguments->children)
         {
-            if (argument->as<ASTSelectWithUnionQuery>())
+            if (is_view && argument->as<ASTSelectWithUnionQuery>())
                 continue;
             if (const auto * nested = argument->as<ASTFunction>(); nested && TableFunctionFactory::instance().isTableFunctionName(nested->name))
-                continue;
-            checkAccessToCreateTableTargets(*argument, context, bound);
+                walkArgumentsWithoutHook(*nested, context, bound);
+            else
+                checkAccessToCreateTableTargets(*argument, context, bound);
         }
     }
 

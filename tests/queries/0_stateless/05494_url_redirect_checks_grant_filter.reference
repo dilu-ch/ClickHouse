@@ -41,6 +41,7 @@ grant TABLE ENGINE ON URL
 grant TABLE ENGINE ON URL
 grant TABLE ENGINE ON URL
 grant TABLE ENGINE ON URL
+grant TABLE ENGINE ON URL
 grant READ ON URL
 Pepyaka
 --- a parameterized view in a persisted view is not a table function
@@ -62,6 +63,8 @@ Pepyaka
 1
 grant READ ON URL
 grant READ ON URL
+1
+1
 1
 1
 1
