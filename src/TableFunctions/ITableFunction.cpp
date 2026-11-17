@@ -117,16 +117,17 @@ void ITableFunction::checkAccessToCreateTableTarget(const ASTPtr & table_functio
             "function or in a table engine argument",
             name);
 
-    /// A grant on a source is matched against the first argument, which names the source, or against an override of a
-    /// named collection, `key = value` with any spelling of the key, so they must mean here what they mean where the
-    /// query runs. The other arguments, e.g. a sharding key, may vary.
+    /// A grant on a source is matched against the argument that names the source, the first one, or the second one
+    /// of a cluster function, or against an override of a named collection, `key = value` with any spelling of the
+    /// key, so they must mean here what they mean where the query runs. The other arguments, e.g. a sharding key, may vary.
     if (const auto & function = table_function_ast->as<ASTFunction &>(); function.arguments && unparsed->getSourceAccessObject())
     {
         const auto & arguments = function.arguments->children;
+        const size_t source_index = unparsed->isClusterFunction() ? 1 : 0;
         for (size_t i = 0; i < arguments.size(); ++i)
         {
             const auto * assignment = arguments[i]->as<ASTFunction>();
-            if (i == 0 || (assignment && assignment->name == "equals"))
+            if (i == source_index || (assignment && assignment->name == "equals"))
                 throwIfValueVariesByContext(*arguments[i], context);
         }
     }

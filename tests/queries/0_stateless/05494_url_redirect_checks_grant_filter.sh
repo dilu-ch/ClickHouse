@@ -195,6 +195,8 @@ ${CLICKHOUSE_CLIENT} --query "EXISTS TABLE t_view_deep"
 # The veto of a function that the reader's grants resolve holds at any depth.
 ${CLICKHOUSE_CLIENT} --user "$user_filtered" --query "CREATE TABLE t_view_with_denied (x UInt8) AS remote('127.0.0.1:1', view(SELECT * FROM viewIfPermitted(SELECT 1 AS x ELSE null('x UInt8'))))" 2>&1 | grep -c -m1 "cannot be used to create a table"
 ${CLICKHOUSE_CLIENT} --user "$user_filtered" --query "CREATE TABLE t_view_with_denied (x UInt8) AS remote('127.0.0.1:1', view(SELECT * FROM eval('SELECT 1 AS x')))" --enable_eval_table_function 1 2>&1 | grep -c -m1 "cannot be used to create a table"
+# The source of a cluster function is its second argument.
+${CLICKHOUSE_CLIENT} --user "$user_filtered" --query "CREATE TABLE t_view_with_denied (s String) AS remote('127.0.0.1:1', view(SELECT * FROM urlCluster('test_shard_localhost', if(currentUser() = 'x', '$redirector', 'http://x'), 'LineAsString', 's String')))" 2>&1 | grep -c -m1 "depends on where the query runs"
 
 ${CLICKHOUSE_CLIENT} --query "DROP TABLE t_redirect"
 ${CLICKHOUSE_CLIENT} --query "DROP TABLE t_redirect_inferred"
