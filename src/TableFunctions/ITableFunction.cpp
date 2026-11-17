@@ -108,9 +108,9 @@ void ITableFunction::checkAccessToCreateTableTarget(const ASTPtr & table_functio
     if (!factory.isTableFunctionName(name))
         return;
 
-    /// The same vetoes as for the outermost function of a definition, see `InterpreterCreateQuery`.
+    /// The same veto as for the outermost function of a definition, see `InterpreterCreateQuery`.
     const auto unparsed = factory.tryGet(name, context);
-    if (unparsed->dependsOnCurrentUserGrants() || !unparsed->canBeUsedToCreateTable())
+    if (unparsed->dependsOnCurrentUserGrants())
         throw Exception(
             ErrorCodes::BAD_ARGUMENTS,
             "Table function '{}' cannot be used to create a table, neither directly nor nested in another table "
