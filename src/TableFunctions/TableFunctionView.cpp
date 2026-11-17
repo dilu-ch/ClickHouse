@@ -7,6 +7,7 @@
 #include <Parsers/ASTLiteral.h>
 #include <Parsers/ASTSelectQuery.h>
 #include <Parsers/ASTSelectWithUnionQuery.h>
+#include <Parsers/ASTSubquery.h>
 #include <Parsers/ASTTablesInSelectQuery.h>
 #include <Parsers/ASTWithAlias.h>
 #include <Storages/StorageView.h>
@@ -54,8 +55,7 @@ void TableFunctionView::parseArguments(const ASTPtr & ast_function, ContextPtr /
 
 namespace
 {
-    /// What the `WITH` clause and the projection bind to a name, visible in the query and its subqueries: a literal,
-    /// or null for an expression, which has no value to check before the query runs.
+    /// What the `WITH` clause and the projection bind to a name, visible in the query and its subqueries.
     using BoundByAlias = UnorderedMapWithMemoryTracking<String, ASTPtr>;
 
     void collectAliases(const ASTSelectQuery & select, BoundByAlias & bound)
@@ -66,11 +66,36 @@ namespace
                 continue;
             for (const auto & child : list->children)
                 if (const auto * with_alias = dynamic_cast<const ASTWithAlias *>(child.get()); with_alias && !with_alias->alias.empty())
-                    bound[with_alias->alias] = child->as<ASTLiteral>() ? child : nullptr;
+                    bound[with_alias->alias] = child;
         }
     }
 
-    /// The function with its identifier arguments replaced by the literals they are bound to, so that it parses as it runs.
+    /// Writes the expressions that bound identifiers stand for into an argument, through chains of aliases, for the
+    /// function to evaluate as it does when it runs. A nested query keeps its own scope and check.
+    void substituteBoundIdentifiers(ASTPtr & ast, const BoundByAlias & bound, size_t alias_hops)
+    {
+        if (alias_hops > 16)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "The aliases of the query are chained too deep to resolve");
+        if (ast->as<ASTSelectWithUnionQuery>() || ast->as<ASTSelectQuery>() || ast->as<ASTSubquery>())
+            return;
+
+        if (const auto * identifier = ast->as<ASTIdentifier>(); identifier && !ast->as<ASTTableIdentifier>())
+        {
+            const auto it = bound.find(identifier->name());
+            if (it == bound.end())
+                return;
+            auto value = it->second->clone();
+            substituteBoundIdentifiers(value, bound, alias_hops + 1);
+            if (auto * with_alias = dynamic_cast<ASTWithAlias *>(value.get()))
+                with_alias->alias.clear();
+            ast = value;
+            return;
+        }
+        for (auto & child : ast->children)
+            substituteBoundIdentifiers(child, bound, alias_hops);
+    }
+
+    /// The function with the expressions its arguments are bound to written out, so that it parses as it runs.
     ASTPtr withAliasesSubstituted(const ASTPtr & table_function, const BoundByAlias & bound)
     {
         if (bound.empty())
@@ -78,26 +103,9 @@ namespace
 
         auto result = table_function->clone();
         auto & function = result->as<ASTFunction &>();
-        if (!function.arguments)
-            return result;
-        for (auto & argument : function.arguments->children)
-        {
-            const auto * identifier = argument->as<ASTIdentifier>();
-            if (!identifier)
-                continue;
-            const auto it = bound.find(identifier->name());
-            if (it == bound.end())
-                continue;
-            if (!it->second)
-                throw Exception(
-                    ErrorCodes::BAD_ARGUMENTS,
-                    "Argument `{}` of the table function `{}` is bound to an expression, which cannot be checked for a persisted "
-                    "table: write its value out",
-                    identifier->name(),
-                    function.name);
-            argument = it->second->clone();
-            argument->as<ASTLiteral &>().alias.clear();
-        }
+        if (function.arguments)
+            for (auto & argument : function.arguments->children)
+                substituteBoundIdentifiers(argument, bound, 0);
         return result;
     }
 

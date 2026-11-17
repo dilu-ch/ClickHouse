@@ -114,6 +114,10 @@ public:
     /// `loop`, the `Remote` engine) persists as its target. Does nothing for a null AST.
     static void checkAccessToCreateTableTarget(const ASTPtr & table_function_ast, ContextPtr context);
 
+    /// Refuses a value of a persisted target that may differ where the definition runs: a subquery, or a function
+    /// that is not deterministic, such as `currentUser`. A nested query is not entered, it has its own check.
+    static void throwIfValueVariesByContext(const IAST & value, const ContextPtr & context);
+
     /// Whether the storage this table function returns is chosen by the current user's grants
     /// (e.g. `viewIfPermitted`). Such a function cannot appear anywhere in a persisted table
     /// definition, not even nested in an argument of another table function such as `remote`:

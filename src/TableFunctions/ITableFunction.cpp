@@ -1,6 +1,9 @@
 #include <Access/ContextAccess.h>
 #include <TableFunctions/ITableFunction.h>
 #include <Parsers/ASTFunction.h>
+#include <Parsers/ASTSelectWithUnionQuery.h>
+#include <Parsers/ASTSubquery.h>
+#include <Functions/FunctionFactory.h>
 #include <Storages/StorageAlias.h>
 #include <Storages/StorageFactory.h>
 #include <Storages/StorageTableFunction.h>
@@ -24,6 +27,7 @@ namespace DB
 
 namespace ErrorCodes
 {
+    extern const int BAD_ARGUMENTS;
     extern const int LOGICAL_ERROR;
     extern const int ACCESS_DENIED;
 }
@@ -103,6 +107,20 @@ void ITableFunction::checkAccessToCreateTableTarget(const ASTPtr & table_functio
     if (!factory.isTableFunctionName(name))
         return;
 
+    /// The same veto as for the outermost function of a definition, see `InterpreterCreateQuery`.
+    const auto unparsed = factory.tryGet(name, context);
+    if (unparsed->dependsOnCurrentUserGrants())
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS,
+            "Table function '{}' cannot be used to create a table, neither directly nor nested in another table "
+            "function or in a table engine argument",
+            name);
+
+    /// A grant on a source is matched against the arguments, so they must mean here what they mean where the query runs.
+    if (const auto & function = table_function_ast->as<ASTFunction &>(); function.arguments && unparsed->getSourceAccessObject())
+        for (const auto & argument : function.arguments->children)
+            throwIfValueVariesByContext(*argument, context);
+
     TableFunctionPtr table_function;
     try
     {
@@ -115,6 +133,25 @@ void ITableFunction::checkAccessToCreateTableTarget(const ASTPtr & table_functio
         throw;
     }
     table_function->checkAccessToCreateTable(context);
+}
+
+void ITableFunction::throwIfValueVariesByContext(const IAST & value, const ContextPtr & context)
+{
+    if (value.as<ASTSelectWithUnionQuery>())
+        return;
+    if (value.as<ASTSubquery>())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "A subquery in an argument of a table function persisted in a table cannot be checked");
+
+    if (const auto * function = value.as<ASTFunction>())
+        if (const auto resolver = FunctionFactory::instance().tryGet(function->name, context); resolver && !resolver->isDeterministic())
+            throw Exception(
+                ErrorCodes::BAD_ARGUMENTS,
+                "An argument of a table function persisted in a table uses `{}`, whose value depends on where the query runs, "
+                "and cannot be checked",
+                function->name);
+
+    for (const auto & child : value.children)
+        throwIfValueVariesByContext(*child, context);
 }
 
 ColumnsDescription ITableFunction::getActualTableStructureWithAccess(ContextPtr context, bool is_insert_query) const

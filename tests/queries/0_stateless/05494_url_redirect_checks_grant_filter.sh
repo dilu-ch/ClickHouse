@@ -159,11 +159,21 @@ echo "--- an argument bound by an alias in a persisted view is checked as its va
 # The filtered grant matches the literal, not the name `u`, so this creation proves the substitution.
 ${CLICKHOUSE_CLIENT} --user "$user_filtered" --query "CREATE TABLE t_view_with_filtered AS remote('127.0.0.1', view(WITH '$redirector' AS u SELECT * FROM url(u, 'LineAsString', 's String')))"
 ${CLICKHOUSE_CLIENT} --query "EXISTS TABLE t_view_with_filtered"
-${CLICKHOUSE_CLIENT} --user "$user_filtered" --query "CREATE TABLE t_view_with_denied AS remote('127.0.0.1', view(WITH concat('http://', 'x') AS u SELECT * FROM url(u, 'LineAsString', 's String')))" 2>&1 | grep -c -m1 "bound to an expression"
+# A chain of aliases and a constant expression resolve to their value; a value taken from a column has none.
+${CLICKHOUSE_CLIENT} --user "$user_filtered" --query "CREATE TABLE t_view_with_chain AS remote('127.0.0.1', view(WITH '$redirector' AS u, u AS v SELECT * FROM url(v, 'LineAsString', 's String')))"
+${CLICKHOUSE_CLIENT} --user "$user_filtered" --query "CREATE TABLE t_view_with_concat AS remote('127.0.0.1', view(WITH concat('http://localhost:${CLICKHOUSE_PORT_HTTP}/', 'upyachka') AS u SELECT * FROM url(concat(u, ''), 'LineAsString', 's String')))"
+${CLICKHOUSE_CLIENT} --query "EXISTS TABLE t_view_with_chain"
+${CLICKHOUSE_CLIENT} --query "EXISTS TABLE t_view_with_concat"
+${CLICKHOUSE_CLIENT} --user "$user_filtered" --query "CREATE TABLE t_view_with_denied AS remote('127.0.0.1', view(WITH toString(number) AS u SELECT * FROM url(u, 'LineAsString', 's String')))" 2>&1 | grep -c -m1 "Unknown expression or function identifier"
+# A value that differs where the query runs, and an alias of an inner query, are not taken from the outer scope.
+${CLICKHOUSE_CLIENT} --user "$user_filtered" --query "CREATE TABLE t_view_with_denied AS remote('127.0.0.1', view(WITH if(currentUser() = 'x', 'http://x', '$redirector') AS u SELECT * FROM url(u, 'LineAsString', 's String')))" 2>&1 | grep -c -m1 "depends on where the query runs"
+${CLICKHOUSE_CLIENT} --user "$user_filtered" --query "CREATE TABLE t_view_with_denied AS remote('127.0.0.1', view(WITH '$redirector' AS u SELECT * FROM view(WITH 'http://localhost:${CLICKHOUSE_PORT_HTTP}/?query=SELECT+1' AS u SELECT * FROM url(u, 'LineAsString', 's String'))))" 2>&1 | grep -c -m1 "Not enough privileges"
 ${CLICKHOUSE_CLIENT} --user "$user_filtered" --query "CREATE TABLE t_view_with_denied AS remote('127.0.0.1', view(SELECT 'http://x' AS u FROM url(u, 'LineAsString', 's String')))" 2>&1 | grep -c -m1 "Not enough privileges"
+# The veto of a function that the reader's grants resolve holds at any depth.
+${CLICKHOUSE_CLIENT} --user "$user_filtered" --query "CREATE TABLE t_view_with_denied (x UInt8) AS remote('127.0.0.1:1', view(SELECT * FROM viewIfPermitted(SELECT 1 AS x ELSE null('x UInt8'))))" 2>&1 | grep -c -m1 "cannot be used to create a table"
 
 ${CLICKHOUSE_CLIENT} --query "DROP TABLE t_redirect"
 ${CLICKHOUSE_CLIENT} --query "DROP TABLE t_redirect_inferred"
-${CLICKHOUSE_CLIENT} --query "DROP TABLE t_redirect_as_function, t_redirect_as_function_lazy, t_as_function_created, t_remote_src, t_restored, t_view_pv, t_view_with, t_view_nested, t_view_remote_only, t_view_with_filtered"
+${CLICKHOUSE_CLIENT} --query "DROP TABLE t_redirect_as_function, t_redirect_as_function_lazy, t_as_function_created, t_remote_src, t_restored, t_view_pv, t_view_with, t_view_nested, t_view_remote_only, t_view_with_filtered, t_view_with_chain, t_view_with_concat"
 ${CLICKHOUSE_CLIENT} --query "DROP VIEW pv_05494"
 ${CLICKHOUSE_CLIENT} --query "DROP USER $user_filtered, $user_full, $user_engine, $user_table, $user_legacy"
