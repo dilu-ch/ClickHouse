@@ -9,7 +9,6 @@ namespace DB
 
 namespace ErrorCodes
 {
-    extern const int ACCESS_DENIED;
     extern const int NOT_IMPLEMENTED;
 }
 
@@ -55,11 +54,7 @@ StoragePtr TableFunctionURLCluster::getStorage(
             /*check_redirect_access=*/ !is_table_definition);
     }
 
-    if (!callerGrantAppliesOnWorkers(context, cluster_name))
-        throw Exception(
-            ErrorCodes::ACCESS_DENIED,
-            "Not enough privileges. To execute this query, it's necessary to have the grant READ ON URL without a filter: "
-            "the cluster workers follow redirects as the cluster user");
+    checkCallerGrantAppliesOnWorkers(context, cluster_name);
 
     return std::make_shared<StorageURLCluster>(
         context,
@@ -71,6 +66,13 @@ StoragePtr TableFunctionURLCluster::getStorage(
         is_structure_not_overridable ? ColumnsDescription{} : columns,
         ConstraintsDescription{},
         configuration);
+}
+
+void TableFunctionURLCluster::checkAccessToCreateTable(ContextPtr context) const
+{
+    TableFunctionURL::checkAccessToCreateTable(context);
+    /// A persisted target runs on the workers as the cluster user as well.
+    checkCallerGrantAppliesOnWorkers(context, cluster_name);
 }
 
 void registerTableFunctionURLCluster(TableFunctionFactory & factory)

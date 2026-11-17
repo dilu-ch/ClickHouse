@@ -175,6 +175,9 @@ ${CLICKHOUSE_CLIENT} --user "$user_filtered" --query "CREATE TABLE t_view_with_d
 ${CLICKHOUSE_CLIENT} --user "$user_filtered" --query "CREATE TABLE t_view_with_denied AS remote('127.0.0.1', view(WITH if(currentUser() = 'x', 'http://x', '$redirector') AS u SELECT * FROM url(u, 'LineAsString', 's String')))" 2>&1 | grep -c -m1 "depends on where the query runs"
 ${CLICKHOUSE_CLIENT} --user "$user_filtered" --query "CREATE TABLE t_view_with_denied AS remote('127.0.0.1', view(WITH '$redirector' AS u SELECT * FROM view(WITH 'http://localhost:${CLICKHOUSE_PORT_HTTP}/?query=SELECT+1' AS u SELECT * FROM url(u, 'LineAsString', 's String'))))" 2>&1 | grep -c -m1 "Not enough privileges"
 ${CLICKHOUSE_CLIENT} --user "$user_filtered" --query "CREATE TABLE t_view_with_denied AS remote('127.0.0.1', view(SELECT 'http://x' AS u FROM url(u, 'LineAsString', 's String')))" 2>&1 | grep -c -m1 "Not enough privileges"
+# A nested target keeps the fail-closes of a read: the cluster user of `urlCluster`, and a wildcard from index pages.
+check_missing_grant "$user_filtered" "CREATE TABLE t_as_function_denied AS remote('127.0.0.1', urlCluster('test_shard_localhost', '$redirector', 'LineAsString', 's String'))"
+check_missing_grant "$user_filtered" "CREATE TABLE t_as_function_denied AS remote('127.0.0.1', url('http://localhost:${CLICKHOUSE_PORT_HTTP}/upyachka*', 'RawBLOB', 's String'))" --allow_url_wildcard_from_index_pages 1
 # The veto of a function that the reader's grants resolve holds at any depth.
 ${CLICKHOUSE_CLIENT} --user "$user_filtered" --query "CREATE TABLE t_view_with_denied (x UInt8) AS remote('127.0.0.1:1', view(SELECT * FROM viewIfPermitted(SELECT 1 AS x ELSE null('x UInt8'))))" 2>&1 | grep -c -m1 "cannot be used to create a table"
 

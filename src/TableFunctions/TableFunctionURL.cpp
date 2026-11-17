@@ -41,6 +41,7 @@ namespace Setting
 
 namespace ErrorCodes
 {
+    extern const int ACCESS_DENIED;
     extern const int BAD_ARGUMENTS;
     extern const int SUPPORT_IS_DISABLED;
 }
@@ -358,6 +359,15 @@ bool TableFunctionURL::callerGrantAppliesOnWorkers(const ContextPtr & context, c
         || !context->getCluster(cluster_name)->getSecret().empty();
 }
 
+void TableFunctionURL::checkCallerGrantAppliesOnWorkers(const ContextPtr & context, const String & cluster_name)
+{
+    if (!callerGrantAppliesOnWorkers(context, cluster_name))
+        throw Exception(
+            ErrorCodes::ACCESS_DENIED,
+            "Not enough privileges. To execute this query, it's necessary to have the grant READ ON URL without a filter: "
+            "the cluster workers follow redirects as the cluster user");
+}
+
 StoragePtr TableFunctionURL::getStorage(
     const String & source, const String & format_, const ColumnsDescription & columns, ContextPtr context,
     const std::string & table_name, const String & compression_method_, bool is_insert_query, bool is_table_definition) const
@@ -454,6 +464,10 @@ void TableFunctionURL::checkAccessToCreateTable(ContextPtr context) const
     /// which no URL filter bounds, and `READ` on the URL itself even when a column list skips the schema inference.
     checkEngineAccess(context);
     checkSourceAccess(context, /*is_insert_query=*/ false);
+
+    /// The same fail-close as for a read: index pages are listed without the per-hop check.
+    if (configuration.http_method.empty() && urlPathHasListableGlobs(filename))
+        checkWholeSourceAccessForURLWildcard(context);
 }
 
 ColumnsDescription TableFunctionURL::getActualTableStructure(ContextPtr context, bool is_insert_query) const
