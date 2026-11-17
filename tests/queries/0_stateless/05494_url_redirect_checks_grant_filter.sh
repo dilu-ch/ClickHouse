@@ -15,16 +15,21 @@ user_filtered="user05494_filtered_${CLICKHOUSE_DATABASE}_$RANDOM"
 user_full="user05494_full_${CLICKHOUSE_DATABASE}_$RANDOM"
 user_engine="user05494_engine_${CLICKHOUSE_DATABASE}_$RANDOM"
 user_table="user05494_table_${CLICKHOUSE_DATABASE}_$RANDOM"
+user_legacy="user05494_legacy_${CLICKHOUSE_DATABASE}_$RANDOM"
 redirector="http://localhost:${CLICKHOUSE_PORT_HTTP}/upyachka"
 escaped_redirector="http://localhost:${CLICKHOUSE_PORT_HTTP}/upyachka_escaped"
 head_redirector="http://localhost:${CLICKHOUSE_PORT_HTTP}/upyachka_head"
 
 ${CLICKHOUSE_CLIENT} <<EOF
-DROP USER IF EXISTS $user_filtered, $user_full, $user_engine, $user_table;
+DROP USER IF EXISTS $user_filtered, $user_full, $user_engine, $user_table, $user_legacy;
 CREATE USER $user_filtered;
 CREATE USER $user_full;
 CREATE USER $user_engine;
 CREATE USER $user_table;
+CREATE USER $user_legacy;
+GRANT CREATE TEMPORARY TABLE ON *.*, CLUSTER ON *.*, CREATE TABLE ON ${CLICKHOUSE_DATABASE}.* TO $user_legacy;
+GRANT TABLE ENGINE ON URL TO $user_legacy;
+GRANT READ ON URL TO $user_legacy;
 GRANT CREATE TEMPORARY TABLE ON *.* TO $user_filtered, $user_full;
 GRANT CLUSTER ON *.* TO $user_filtered, $user_full;
 GRANT READ ON URL('http://localhost:${CLICKHOUSE_PORT_HTTP}/upyachka') TO $user_filtered;
@@ -100,6 +105,9 @@ ${CLICKHOUSE_CLIENT} --query "GRANT CREATE TABLE ON ${CLICKHOUSE_DATABASE}.* TO 
 check_missing_grant "$user_filtered" "CREATE TABLE t_as_function_denied AS url('$redirector', 'LineAsString', 's String')"
 # The legacy `ON CLUSTER` entry format executes the function on the workers with no user.
 check_missing_grant "$user_filtered" "CREATE TABLE t_as_function_denied ON CLUSTER test_shard_localhost AS url('$redirector', 'LineAsString', 's String')" --distributed_ddl_entry_format_version 2 --distributed_ddl_output_mode throw
+# The legacy format also runs the checks `execute` runs locally, and the vetoes of a definition.
+check_missing_grant "$user_legacy" "CREATE TABLE t_as_function_denied ON CLUSTER test_shard_localhost AS url('$redirector', 'LineAsString', 's String')" --distributed_ddl_entry_format_version 2 --distributed_ddl_output_mode throw
+${CLICKHOUSE_CLIENT} --user "$user_legacy" --distributed_ddl_entry_format_version 2 --distributed_ddl_output_mode throw --query "CREATE TABLE t_as_function_denied ON CLUSTER test_shard_localhost AS viewIfPermitted(SELECT 1 ELSE null('x UInt8'))" 2>&1 | grep -c -m1 "cannot be used to create a table"
 # The shards resolve a target nested in `remote` under the connection's user.
 ${CLICKHOUSE_CLIENT} --query "GRANT REMOTE ON *.* TO $user_filtered"
 check_missing_grant "$user_filtered" "CREATE TABLE t_as_function_denied AS remote('127.0.0.1', url('$redirector', 'LineAsString', 's String'))"
@@ -128,8 +136,9 @@ echo "--- a parameterized view in a persisted view is not a table function"
 ${CLICKHOUSE_CLIENT} --query "CREATE VIEW pv_05494 AS SELECT {x:UInt64} AS x"
 ${CLICKHOUSE_CLIENT} --query "CREATE TABLE t_view_pv AS view(SELECT * FROM pv_05494(x = 1))"
 ${CLICKHOUSE_CLIENT} --query "EXISTS TABLE t_view_pv"
-# An argument bound by `WITH` cannot be checked as written, so such a target is refused.
-${CLICKHOUSE_CLIENT} --query "CREATE TABLE t_view_with AS view(WITH '$redirector' AS u SELECT * FROM url(u, 'LineAsString', 's String'))" 2>&1 | grep -c -m1 "with its arguments as written"
+# A URL bound by `WITH` is checked as the literal it stands for.
+${CLICKHOUSE_CLIENT} --query "CREATE TABLE t_view_with AS view(WITH '$redirector' AS u SELECT * FROM url(u, 'LineAsString', 's String'))"
+${CLICKHOUSE_CLIENT} --query "EXISTS TABLE t_view_with"
 # A nested view, and a view over a table that exists only on the remote shard.
 ${CLICKHOUSE_CLIENT} --query "CREATE TABLE t_view_nested AS view(SELECT * FROM view(SELECT * FROM numbers(1)))"
 ${CLICKHOUSE_CLIENT} --query "EXISTS TABLE t_view_nested"
@@ -149,6 +158,6 @@ ${CLICKHOUSE_CLIENT} --max_http_get_redirects 1 --query "SELECT * FROM t_restore
 
 ${CLICKHOUSE_CLIENT} --query "DROP TABLE t_redirect"
 ${CLICKHOUSE_CLIENT} --query "DROP TABLE t_redirect_inferred"
-${CLICKHOUSE_CLIENT} --query "DROP TABLE t_redirect_as_function, t_redirect_as_function_lazy, t_as_function_created, t_remote_src, t_restored, t_view_pv, t_view_nested, t_view_remote_only"
+${CLICKHOUSE_CLIENT} --query "DROP TABLE t_redirect_as_function, t_redirect_as_function_lazy, t_as_function_created, t_remote_src, t_restored, t_view_pv, t_view_with, t_view_nested, t_view_remote_only"
 ${CLICKHOUSE_CLIENT} --query "DROP VIEW pv_05494"
-${CLICKHOUSE_CLIENT} --query "DROP USER $user_filtered, $user_full, $user_engine, $user_table"
+${CLICKHOUSE_CLIENT} --query "DROP USER $user_filtered, $user_full, $user_engine, $user_table, $user_legacy"

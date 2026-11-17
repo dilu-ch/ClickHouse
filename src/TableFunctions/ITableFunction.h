@@ -180,6 +180,9 @@ public:
     /// Check the `TABLE ENGINE` grant, for engines that opt in via `requiresTableEngineGrant`.
     void checkEngineAccessIfRequired(ContextPtr context) const;
 
+    /// The grants `execute` checks before running the function, for a statement whose table is built elsewhere.
+    void checkAccessToExecute(ContextPtr context, bool is_insert_query, bool check_create_temporary_table, bool check_source_access) const;
+
     /// `uri` normalized by Poco; an unparsable URI becomes empty.
     static String normalizeURIForAccessCheck(const String & uri);
 

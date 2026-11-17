@@ -2,6 +2,9 @@
 #include <Interpreters/InterpreterSelectQueryAnalyzer.h>
 #include <Interpreters/Context.h>
 #include <Parsers/ASTFunction.h>
+#include <Parsers/ASTIdentifier.h>
+#include <Parsers/ASTLiteral.h>
+#include <Parsers/ASTSelectQuery.h>
 #include <Parsers/ASTSelectWithUnionQuery.h>
 #include <Parsers/ASTTablesInSelectQuery.h>
 #include <Storages/StorageView.h>
@@ -49,23 +52,63 @@ void TableFunctionView::parseArguments(const ASTPtr & ast_function, ContextPtr /
 
 namespace
 {
-    /// The query is not analyzed: a carrier such as `remote` may run it where tables unknown here exist.
-    void checkAccessToCreateTableTargets(const IAST & ast, const ContextPtr & context)
+    /// The literals a `WITH` clause binds to a name, visible in the query and its subqueries.
+    using LiteralsByAlias = std::unordered_map<String, ASTPtr>;
+
+    void collectLiteralAliases(const ASTSelectQuery & select, LiteralsByAlias & literals)
     {
+        const auto with = select.with();
+        if (!with)
+            return;
+        for (const auto & child : with->children)
+            if (const auto * literal = child->as<ASTLiteral>(); literal && !literal->alias.empty())
+                literals[literal->alias] = child;
+    }
+
+    /// The function with the arguments bound by `WITH` written out, so that it parses as it runs.
+    ASTPtr withLiteralsSubstituted(const ASTPtr & table_function, const LiteralsByAlias & literals)
+    {
+        if (literals.empty())
+            return table_function;
+
+        auto result = table_function->clone();
+        auto & function = result->as<ASTFunction &>();
+        if (!function.arguments)
+            return result;
+        for (auto & argument : function.arguments->children)
+        {
+            const auto * identifier = argument->as<ASTIdentifier>();
+            if (!identifier)
+                continue;
+            if (const auto it = literals.find(identifier->name()); it != literals.end())
+            {
+                argument = it->second->clone();
+                argument->as<ASTLiteral &>().alias.clear();
+            }
+        }
+        return result;
+    }
+
+    /// The query is not analyzed: a carrier such as `remote` may run it where tables unknown here exist.
+    void checkAccessToCreateTableTargets(const IAST & ast, const ContextPtr & context, LiteralsByAlias literals)
+    {
+        if (const auto * select = ast.as<ASTSelectQuery>())
+            collectLiteralAliases(*select, literals);
+
         if (const auto * table_expression = ast.as<ASTTableExpression>(); table_expression && table_expression->table_function)
         {
-            ITableFunction::checkAccessToCreateTableTarget(table_expression->table_function, context);
+            ITableFunction::checkAccessToCreateTableTarget(withLiteralsSubstituted(table_expression->table_function, literals), context);
             return;
         }
         for (const auto & child : ast.children)
-            checkAccessToCreateTableTargets(*child, context);
+            checkAccessToCreateTableTargets(*child, context, literals);
     }
 }
 
 void TableFunctionView::checkAccessToCreateTable(ContextPtr context) const
 {
     /// A carrier may persist the query and run it under another identity, so the table functions it reads are targets too.
-    checkAccessToCreateTableTargets(*create.select, context);
+    checkAccessToCreateTableTargets(*create.select, context, {});
 }
 
 ColumnsDescription TableFunctionView::getActualTableStructure(ContextPtr context, bool /*is_insert_query*/) const

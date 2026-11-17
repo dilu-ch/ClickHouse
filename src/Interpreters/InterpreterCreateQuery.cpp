@@ -4160,16 +4160,23 @@ BlockIO InterpreterCreateQuery::execute()
                 && create.storage->engine->name == "Backup" && create.storage->engine->arguments)
                 DatabaseBackup::parseAndAuthorizeLocator(create.storage->engine->arguments->children, getContext());
 
-            /// The worker builds the table with no user, so the grants to persist a table function target, given
-            /// `AS f(...)` or to the `Remote` engine, are checked here: for the definition as written, and below
-            /// for one inherited from `AS src`.
-            auto check_access_to_create_table_target = [&](const ASTCreateQuery & query)
+            /// The worker builds the table with no user, so everything `doCreateTable` checks for a table function
+            /// definition, `AS f(...)` or a `Remote` target, is checked here: for the definition as written, and
+            /// below for one inherited from `AS src`.
+            auto check_table_function_definition = [&](const ASTCreateQuery & query)
             {
                 if (query.as_table_function)
-                    TableFunctionFactory::instance().get(query.as_table_function->ptr(), getContext())->checkAccessToCreateTable(getContext());
+                {
+                    auto table_function_ast = query.as_table_function->ptr();
+                    auto table_function = TableFunctionFactory::instance().get(table_function_ast, getContext());
+                    throwIfTableFunctionCannotBeUsedToCreateTable(table_function_ast, *table_function, getContext());
+                    table_function->checkAccessToCreateTable(getContext());
+                    table_function->checkAccessToExecute(
+                        getContext(), /*is_insert_query=*/ true, /*check_create_temporary_table=*/ true, /*check_source_access=*/ true);
+                }
                 checkAccessToCreateRemoteTableTarget(query, getContext());
             };
-            check_access_to_create_table_target(create);
+            check_table_function_definition(create);
 
             /// this branch returns before setEngine, and the worker builds AS src with no user, so
             /// check the inherited definition here, on a copy of the query
@@ -4195,7 +4202,7 @@ BlockIO InterpreterCreateQuery::execute()
                 /// getRequiredAccess sees no engine, because this query holds none of its own
                 if (inherited.storage && inherited.storage->engine)
                     getContext()->checkAccess(AccessType::TABLE_ENGINE, inherited.storage->engine->name);
-                check_access_to_create_table_target(inherited);
+                check_table_function_definition(inherited);
 
                 /// setEngine copies only the outer engine of a `TimeSeries` source, and the worker copies
                 /// its inner engines while normalizing, so add the ones this query does not give itself
