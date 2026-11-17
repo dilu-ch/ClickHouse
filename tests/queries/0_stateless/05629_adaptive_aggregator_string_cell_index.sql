@@ -17,6 +17,9 @@ SET adaptive_aggregator_freeze_threshold_bytes = 4194304;
 SET adaptive_aggregator_disable_thaw = 0;
 SET query_plan_aggregation_bucket_top_k = 1;
 SET serialize_query_plan = 0;
+-- Pin (randomized in CI): without the dedicated tracker, the ordinary aggregation of `thawed` measures the growth
+-- of the whole query's memory, which includes the adaptive tables, and converts to two-level without a thaw.
+SET use_aggregation_memory_tracker = 1;
 
 -- Each lane feeds one producer, so every table holds all the keys of its lane whatever the scheduling.
 CREATE VIEW lanes AS
