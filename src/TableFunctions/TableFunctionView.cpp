@@ -109,17 +109,16 @@ namespace
         return result;
     }
 
-    /// The query is not analyzed: a carrier such as `remote` may run it where tables unknown here exist.
+    /// The query is not analyzed: a carrier such as `remote` may run it where tables unknown here exist. The walk goes
+    /// on into the arguments of a table function, where a subquery may read a target the function itself knows nothing of.
     void checkAccessToCreateTableTargets(const IAST & ast, const ContextPtr & context, BoundByAlias bound)
     {
         if (const auto * select = ast.as<ASTSelectQuery>())
             collectAliases(*select, bound);
 
         if (const auto * table_expression = ast.as<ASTTableExpression>(); table_expression && table_expression->table_function)
-        {
             ITableFunction::checkAccessToCreateTableTarget(withAliasesSubstituted(table_expression->table_function, bound), context);
-            return;
-        }
+
         for (const auto & child : ast.children)
             checkAccessToCreateTableTargets(*child, context, bound);
     }

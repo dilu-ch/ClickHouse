@@ -113,6 +113,9 @@ ${CLICKHOUSE_CLIENT} --query "GRANT REMOTE ON *.* TO $user_filtered"
 check_missing_grant "$user_filtered" "CREATE TABLE t_as_function_denied AS remote('127.0.0.1', url('$redirector', 'LineAsString', 's String'))"
 check_missing_grant "$user_filtered" "CREATE TABLE t_as_function_denied AS remote('127.0.0.1', loop(url('$redirector', 'LineAsString', 's String')))"
 check_missing_grant "$user_filtered" "CREATE TABLE t_as_function_denied AS remote('127.0.0.1', view(SELECT * FROM url('$redirector', 'LineAsString', 's String')))"
+# A subquery in an argument of another table function reads the target too.
+check_missing_grant "$user_filtered" "CREATE TABLE t_as_function_denied (s String) AS remote('127.0.0.1:1', view(SELECT * FROM values('s String', (SELECT s FROM url('$redirector', 'LineAsString', 's String') LIMIT 1))))"
+check_missing_grant "$user_filtered" "CREATE TABLE t_as_function_denied (number UInt64) AS remote('127.0.0.1:1', view(SELECT * FROM numbers((SELECT length(s) FROM url('$redirector', 'LineAsString', 's String') LIMIT 1))))"
 ${CLICKHOUSE_CLIENT} --query "GRANT TABLE ENGINE ON Remote TO $user_filtered"
 check_missing_grant "$user_filtered" "CREATE TABLE t_as_function_denied (s String) ENGINE = Remote('127.0.0.1', url('$redirector', 'LineAsString', 's String'))"
 check_missing_grant "$user_filtered" "CREATE TABLE t_as_function_denied ON CLUSTER test_shard_localhost (s String) ENGINE = Remote('127.0.0.1', url('$redirector', 'LineAsString', 's String'))" --distributed_ddl_entry_format_version 2 --distributed_ddl_output_mode throw
@@ -164,6 +167,9 @@ ${CLICKHOUSE_CLIENT} --user "$user_filtered" --query "CREATE TABLE t_view_with_c
 ${CLICKHOUSE_CLIENT} --user "$user_filtered" --query "CREATE TABLE t_view_with_concat AS remote('127.0.0.1', view(WITH concat('http://localhost:${CLICKHOUSE_PORT_HTTP}/', 'upyachka') AS u SELECT * FROM url(concat(u, ''), 'LineAsString', 's String')))"
 ${CLICKHOUSE_CLIENT} --query "EXISTS TABLE t_view_with_chain"
 ${CLICKHOUSE_CLIENT} --query "EXISTS TABLE t_view_with_concat"
+# A sharding key may vary; only the source argument may not.
+${CLICKHOUSE_CLIENT} --query "CREATE TABLE t_view_sharding_key AS view(SELECT * FROM remote('127.0.0.1', system.one, rand()))"
+${CLICKHOUSE_CLIENT} --query "EXISTS TABLE t_view_sharding_key"
 ${CLICKHOUSE_CLIENT} --user "$user_filtered" --query "CREATE TABLE t_view_with_denied AS remote('127.0.0.1', view(WITH toString(number) AS u SELECT * FROM url(u, 'LineAsString', 's String')))" 2>&1 | grep -c -m1 "Unknown expression or function identifier"
 # A value that differs where the query runs, and an alias of an inner query, are not taken from the outer scope.
 ${CLICKHOUSE_CLIENT} --user "$user_filtered" --query "CREATE TABLE t_view_with_denied AS remote('127.0.0.1', view(WITH if(currentUser() = 'x', 'http://x', '$redirector') AS u SELECT * FROM url(u, 'LineAsString', 's String')))" 2>&1 | grep -c -m1 "depends on where the query runs"
@@ -174,6 +180,6 @@ ${CLICKHOUSE_CLIENT} --user "$user_filtered" --query "CREATE TABLE t_view_with_d
 
 ${CLICKHOUSE_CLIENT} --query "DROP TABLE t_redirect"
 ${CLICKHOUSE_CLIENT} --query "DROP TABLE t_redirect_inferred"
-${CLICKHOUSE_CLIENT} --query "DROP TABLE t_redirect_as_function, t_redirect_as_function_lazy, t_as_function_created, t_remote_src, t_restored, t_view_pv, t_view_with, t_view_nested, t_view_remote_only, t_view_with_filtered, t_view_with_chain, t_view_with_concat"
+${CLICKHOUSE_CLIENT} --query "DROP TABLE t_redirect_as_function, t_redirect_as_function_lazy, t_as_function_created, t_remote_src, t_restored, t_view_pv, t_view_with, t_view_nested, t_view_remote_only, t_view_with_filtered, t_view_with_chain, t_view_with_concat, t_view_sharding_key"
 ${CLICKHOUSE_CLIENT} --query "DROP VIEW pv_05494"
 ${CLICKHOUSE_CLIENT} --query "DROP USER $user_filtered, $user_full, $user_engine, $user_table, $user_legacy"

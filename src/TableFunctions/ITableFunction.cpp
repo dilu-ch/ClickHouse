@@ -116,10 +116,11 @@ void ITableFunction::checkAccessToCreateTableTarget(const ASTPtr & table_functio
             "function or in a table engine argument",
             name);
 
-    /// A grant on a source is matched against the arguments, so they must mean here what they mean where the query runs.
-    if (const auto & function = table_function_ast->as<ASTFunction &>(); function.arguments && unparsed->getSourceAccessObject())
-        for (const auto & argument : function.arguments->children)
-            throwIfValueVariesByContext(*argument, context);
+    /// A grant on a source is matched against the first argument, which names the source, so it must mean here what it
+    /// means where the query runs. The other arguments, e.g. a sharding key, may vary.
+    if (const auto & function = table_function_ast->as<ASTFunction &>();
+        function.arguments && !function.arguments->children.empty() && unparsed->getSourceAccessObject())
+        throwIfValueVariesByContext(*function.arguments->children.front(), context);
 
     TableFunctionPtr table_function;
     try
