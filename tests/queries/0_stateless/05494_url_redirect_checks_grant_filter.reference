@@ -49,3 +49,7 @@ Pepyaka
 --- a restored table created AS url needs the grants too
 grant TABLE ENGINE ON URL
 Pepyaka
+--- an argument bound by an alias in a persisted view is checked as its value
+1
+1
+1

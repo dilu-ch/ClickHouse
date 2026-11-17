@@ -7,6 +7,7 @@
 #include <Parsers/ASTSelectQuery.h>
 #include <Parsers/ASTSelectWithUnionQuery.h>
 #include <Parsers/ASTTablesInSelectQuery.h>
+#include <Parsers/ASTWithAlias.h>
 #include <Storages/StorageView.h>
 #include <TableFunctions/ITableFunction.h>
 #include <TableFunctions/TableFunctionFactory.h>
@@ -52,23 +53,26 @@ void TableFunctionView::parseArguments(const ASTPtr & ast_function, ContextPtr /
 
 namespace
 {
-    /// The literals a `WITH` clause binds to a name, visible in the query and its subqueries.
-    using LiteralsByAlias = std::unordered_map<String, ASTPtr>;
+    /// What the `WITH` clause and the projection bind to a name, visible in the query and its subqueries: a literal,
+    /// or null for an expression, which has no value to check before the query runs.
+    using BoundByAlias = std::unordered_map<String, ASTPtr>;
 
-    void collectLiteralAliases(const ASTSelectQuery & select, LiteralsByAlias & literals)
+    void collectAliases(const ASTSelectQuery & select, BoundByAlias & bound)
     {
-        const auto with = select.with();
-        if (!with)
-            return;
-        for (const auto & child : with->children)
-            if (const auto * literal = child->as<ASTLiteral>(); literal && !literal->alias.empty())
-                literals[literal->alias] = child;
+        for (const auto & list : {select.with(), select.select()})
+        {
+            if (!list)
+                continue;
+            for (const auto & child : list->children)
+                if (const auto * with_alias = dynamic_cast<const ASTWithAlias *>(child.get()); with_alias && !with_alias->alias.empty())
+                    bound[with_alias->alias] = child->as<ASTLiteral>() ? child : nullptr;
+        }
     }
 
-    /// The function with the arguments bound by `WITH` written out, so that it parses as it runs.
-    ASTPtr withLiteralsSubstituted(const ASTPtr & table_function, const LiteralsByAlias & literals)
+    /// The function with its identifier arguments replaced by the literals they are bound to, so that it parses as it runs.
+    ASTPtr withAliasesSubstituted(const ASTPtr & table_function, const BoundByAlias & bound)
     {
-        if (literals.empty())
+        if (bound.empty())
             return table_function;
 
         auto result = table_function->clone();
@@ -80,28 +84,35 @@ namespace
             const auto * identifier = argument->as<ASTIdentifier>();
             if (!identifier)
                 continue;
-            if (const auto it = literals.find(identifier->name()); it != literals.end())
-            {
-                argument = it->second->clone();
-                argument->as<ASTLiteral &>().alias.clear();
-            }
+            const auto it = bound.find(identifier->name());
+            if (it == bound.end())
+                continue;
+            if (!it->second)
+                throw Exception(
+                    ErrorCodes::BAD_ARGUMENTS,
+                    "Argument `{}` of the table function `{}` is bound to an expression, which cannot be checked for a persisted "
+                    "table: write its value out",
+                    identifier->name(),
+                    function.name);
+            argument = it->second->clone();
+            argument->as<ASTLiteral &>().alias.clear();
         }
         return result;
     }
 
     /// The query is not analyzed: a carrier such as `remote` may run it where tables unknown here exist.
-    void checkAccessToCreateTableTargets(const IAST & ast, const ContextPtr & context, LiteralsByAlias literals)
+    void checkAccessToCreateTableTargets(const IAST & ast, const ContextPtr & context, BoundByAlias bound)
     {
         if (const auto * select = ast.as<ASTSelectQuery>())
-            collectLiteralAliases(*select, literals);
+            collectAliases(*select, bound);
 
         if (const auto * table_expression = ast.as<ASTTableExpression>(); table_expression && table_expression->table_function)
         {
-            ITableFunction::checkAccessToCreateTableTarget(withLiteralsSubstituted(table_expression->table_function, literals), context);
+            ITableFunction::checkAccessToCreateTableTarget(withAliasesSubstituted(table_expression->table_function, bound), context);
             return;
         }
         for (const auto & child : ast.children)
-            checkAccessToCreateTableTargets(*child, context, literals);
+            checkAccessToCreateTableTargets(*child, context, bound);
     }
 }
 
