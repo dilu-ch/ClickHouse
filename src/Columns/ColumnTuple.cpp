@@ -31,11 +31,28 @@ namespace ErrorCodes
 namespace
 {
 
+/// The callers check the source columns with `checkSourceTupleColumns` before projecting them with this mapper.
 const IColumn * getTupleElementSourceColumn(const IColumn * source_column, const void * context)
 {
     return assert_cast<const ColumnTuple &>(*source_column).getColumnPtr(*static_cast<const size_t *>(context)).get();
 }
 
+/// Source columns are addressed by the element index of the column, so they must have the same number of elements.
+void checkSourceTupleColumns(const ColumnsView & source_columns, const ColumnTuple & column, std::string_view operation)
+{
+    source_columns.forEach(
+        [&](const IColumn * source_column)
+        {
+            const auto * source_tuple = typeid_cast<const ColumnTuple *>(source_column);
+            if (!source_tuple || source_tuple->tupleSize() != column.tupleSize())
+                throw Exception(
+                    ErrorCodes::LOGICAL_ERROR,
+                    "Source column for {} of {} is not a Tuple of the same size, but {}",
+                    operation,
+                    column.getName(),
+                    source_column->getName());
+        });
+}
 }
 
 std::string ColumnTuple::getName() const
@@ -815,6 +832,8 @@ size_t ColumnTuple::capacity() const
 void ColumnTuple::prepareForSquashing(const ColumnsView & source_columns, size_t factor)
 {
     const size_t tuple_size = columns.size();
+    checkSourceTupleColumns(source_columns, *this, "squashing");
+
     for (size_t i = 0; i < tuple_size; ++i)
         getColumn(i).prepareForSquashing(source_columns.project(getTupleElementSourceColumn, &i), factor);
 }
@@ -967,15 +986,20 @@ bool ColumnTuple::dynamicStructureEquals(const IColumn & rhs) const
 
 void ColumnTuple::chooseDynamicStructureForMerge(const ColumnsView & source_columns, std::optional<size_t> max_dynamic_subcolumns)
 {
+    checkSourceTupleColumns(source_columns, *this, "merge");
+
     for (size_t i = 0; i != columns.size(); ++i)
         columns[i]->chooseDynamicStructureForMerge(source_columns.project(getTupleElementSourceColumn, &i), max_dynamic_subcolumns);
 }
 
 void ColumnTuple::takeExactDynamicStructureFrom(const IColumn & source)
 {
-    const auto & source_tuple = assert_cast<const ColumnTuple &>(source);
+    const auto * source_tuple = typeid_cast<const ColumnTuple *>(&source);
+    if (!source_tuple || source_tuple->tupleSize() != columns.size())
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Cannot take dynamic structure for {} from {}: it is not a Tuple of the same size", getName(), source.getName());
+
     for (size_t i = 0; i != columns.size(); ++i)
-        columns[i]->takeExactDynamicStructureFrom(*source_tuple.getColumnPtr(i));
+        columns[i]->takeExactDynamicStructureFrom(*source_tuple->getColumnPtr(i));
 }
 
 
@@ -991,6 +1015,8 @@ bool ColumnTuple::hasStatistics() const
 
 void ColumnTuple::takeOrCalculateStatisticsFrom(const ColumnsView & source_columns)
 {
+    checkSourceTupleColumns(source_columns, *this, "statistics");
+
     for (size_t i = 0; i != columns.size(); ++i)
     {
         if (!columns[i])

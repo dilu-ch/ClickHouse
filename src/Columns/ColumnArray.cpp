@@ -603,7 +603,7 @@ struct ColumnArray::ComparatorBase
     {
     }
 
-    ALWAYS_INLINE int compare(size_t lhs, size_t rhs) const
+    [[nodiscard]] ALWAYS_INLINE int compare(size_t lhs, size_t rhs) const
     {
         int res = parent.compareAt(lhs, rhs, parent, nan_direction_hint);
 
@@ -622,7 +622,7 @@ struct ColumnArray::ComparatorCollationBase
     {
     }
 
-    ALWAYS_INLINE int compare(size_t lhs, size_t rhs) const
+    [[nodiscard]] ALWAYS_INLINE int compare(size_t lhs, size_t rhs) const
     {
         int res = parent.compareAtWithCollation(lhs, rhs, parent, nan_direction_hint, *collator);
 
@@ -644,11 +644,19 @@ size_t ColumnArray::capacity() const
 void ColumnArray::prepareForSquashing(const ColumnsView & source_columns, size_t factor)
 {
     size_t new_size = size();
+    /// `getArrayNestedSourceColumn` below relies on this check.
     source_columns.forEach(
         [&](const IColumn * source_column)
         {
-            const auto & source_array_column = assert_cast<const ColumnArray &>(*source_column);
-            new_size += source_array_column.size();
+            const auto * source_array_column = typeid_cast<const ColumnArray *>(source_column);
+            if (!source_array_column)
+                throw Exception(
+                    ErrorCodes::LOGICAL_ERROR,
+                    "Source column for squashing of {} is not Array, but {}",
+                    getName(),
+                    source_column->getName());
+
+            new_size += source_array_column->size();
         });
 
     getOffsets().reserve_exact(new_size * factor);
@@ -1743,18 +1751,39 @@ size_t ColumnArray::getNumberOfDimensions() const
 
 void ColumnArray::chooseDynamicStructureForMerge(const ColumnsView & source_columns, std::optional<size_t> max_dynamic_subcolumns)
 {
+    /// `getArrayNestedSourceColumn` below relies on this check.
+    source_columns.forEach(
+        [&](const IColumn * source_column)
+        {
+            if (!typeid_cast<const ColumnArray *>(source_column))
+                throw Exception(
+                    ErrorCodes::LOGICAL_ERROR, "Source column for merge of {} is not Array, but {}", getName(), source_column->getName());
+        });
+
     data->chooseDynamicStructureForMerge(source_columns.project(getArrayNestedSourceColumn), max_dynamic_subcolumns);
 }
 
 void ColumnArray::takeExactDynamicStructureFrom(const IColumn & source)
 {
-    data->takeExactDynamicStructureFrom(assert_cast<const ColumnArray &>(source).getData());
+    const auto * source_array = typeid_cast<const ColumnArray *>(&source);
+    if (!source_array)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Cannot take dynamic structure for {} from {}: it is not Array", getName(), source.getName());
+
+    data->takeExactDynamicStructureFrom(source_array->getData());
 }
 
 void ColumnArray::takeOrCalculateStatisticsFrom(const ColumnsView & source_columns)
 {
     if (!data)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Data column is invalid");
+
+    /// `getArrayNestedSourceColumn` below relies on this check.
+    source_columns.forEach(
+        [&](const IColumn * source_column)
+        {
+            if (!typeid_cast<const ColumnArray *>(source_column))
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "Source column is not Array, but {}", source_column->getName());
+        });
 
     data->takeOrCalculateStatisticsFrom(source_columns.project(getArrayNestedSourceColumn));
 }

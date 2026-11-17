@@ -371,7 +371,7 @@ public:
     }
 
     /// The number of rows the whole filter keeps.
-    size_t countAll() const
+    [[nodiscard]] size_t countAll() const
     {
         size_t res = kept_before_word + std::popcount(bits);
         const size_t next_word_begin = (word + 1) * 64;
@@ -381,7 +381,7 @@ public:
     }
 
 private:
-    UInt64 loadWord(size_t w) const
+    [[nodiscard]] UInt64 loadWord(size_t w) const
     {
         const size_t begin = w * 64;
         if (begin + 64 <= size)
@@ -1077,6 +1077,15 @@ ColumnSparse::Iterator ColumnSparse::getIterator(size_t n) const
 namespace
 {
 
+const ColumnSparse & getSourceSparseColumn(const IColumn & source, const ColumnSparse & column, std::string_view operation)
+{
+    const auto * source_sparse = typeid_cast<const ColumnSparse *>(&source);
+    if (!source_sparse)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Source column for {} of {} is not Sparse, but {}", operation, column.getName(), source.getName());
+    return *source_sparse;
+}
+
+/// The callers check the source columns with `getSourceSparseColumn` before projecting them with this mapper.
 const IColumn * getSparseValuesSourceColumn(const IColumn * source_column, const void *)
 {
     return assert_cast<const ColumnSparse &>(*source_column).getValuesPtr().get();
@@ -1086,16 +1095,18 @@ const IColumn * getSparseValuesSourceColumn(const IColumn * source_column, const
 
 void ColumnSparse::chooseDynamicStructureForMerge(const ColumnsView & source_columns, std::optional<size_t> max_dynamic_subcolumns)
 {
+    source_columns.forEach([&](const IColumn * source_column) { getSourceSparseColumn(*source_column, *this, "merge"); });
     values->chooseDynamicStructureForMerge(source_columns.project(getSparseValuesSourceColumn), max_dynamic_subcolumns);
 }
 
 void ColumnSparse::takeExactDynamicStructureFrom(const IColumn & source)
 {
-    values->takeExactDynamicStructureFrom(assert_cast<const ColumnSparse &>(source).getValuesColumn());
+    values->takeExactDynamicStructureFrom(getSourceSparseColumn(source, *this, "dynamic structure").getValuesColumn());
 }
 
 void ColumnSparse::takeOrCalculateStatisticsFrom(const ColumnsView & source_columns)
 {
+    source_columns.forEach([&](const IColumn * source_column) { getSourceSparseColumn(*source_column, *this, "statistics"); });
     values->takeOrCalculateStatisticsFrom(source_columns.project(getSparseValuesSourceColumn));
 }
 

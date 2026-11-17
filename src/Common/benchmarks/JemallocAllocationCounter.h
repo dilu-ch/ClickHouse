@@ -72,7 +72,7 @@ public:
     JemallocAllocationCounter(const JemallocAllocationCounter &) = delete;
     JemallocAllocationCounter & operator=(const JemallocAllocationCounter &) = delete;
 
-    bool isAvailable() const { return available; }
+    [[nodiscard]] bool isAvailable() const { return available; }
 
     bool start()
     {
@@ -112,7 +112,7 @@ public:
 
 private:
 #if USE_JEMALLOC
-    bool flushThreadCacheAndRefreshStats() const
+    [[nodiscard]] bool flushThreadCacheAndRefreshStats() const
     {
         if (thread_cache_enabled && je_mallctl("thread.tcache.flush", nullptr, nullptr, nullptr, 0) != 0)
             return false;

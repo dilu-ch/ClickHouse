@@ -128,7 +128,7 @@ public:
             const_cast<void *>(static_cast<const void *>(std::addressof(callback))));
     }
 
-    std::optional<const IColumn *> tryGetSingle() const
+    [[nodiscard]] std::optional<const IColumn *> tryGetSingle() const
     {
         return std::visit(
             Overloaded{
@@ -179,7 +179,7 @@ public:
             storage);
     }
 
-    size_t size() const
+    [[nodiscard]] size_t size() const
     {
         return std::visit(
             Overloaded{
@@ -197,7 +197,7 @@ public:
             storage);
     }
 
-    bool empty() const
+    [[nodiscard]] bool empty() const
     {
         return std::visit(
             Overloaded{
@@ -345,7 +345,7 @@ class GroupedColumns
 {
 public:
     /// The number of groups.
-    size_t size() const { return group_offsets.size() - 1; }
+    [[nodiscard]] size_t size() const { return group_offsets.size() - 1; }
 
     /// The columns of `group`, in the order of the source columns.
     ColumnsView operator[](size_t group) const &
