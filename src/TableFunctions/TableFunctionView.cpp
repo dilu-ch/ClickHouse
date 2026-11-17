@@ -1,4 +1,5 @@
 #include <Core/Settings.h>
+#include <Common/UnorderedMapWithMemoryTracking.h>
 #include <Interpreters/InterpreterSelectQueryAnalyzer.h>
 #include <Interpreters/Context.h>
 #include <Parsers/ASTFunction.h>
@@ -55,7 +56,7 @@ namespace
 {
     /// What the `WITH` clause and the projection bind to a name, visible in the query and its subqueries: a literal,
     /// or null for an expression, which has no value to check before the query runs.
-    using BoundByAlias = std::unordered_map<String, ASTPtr>;
+    using BoundByAlias = UnorderedMapWithMemoryTracking<String, ASTPtr>;
 
     void collectAliases(const ASTSelectQuery & select, BoundByAlias & bound)
     {
