@@ -2201,9 +2201,11 @@ class SettingsRandomizer:
         "use_columns_cache": lambda: random.randint(0, 1),
         "enable_reads_from_columns_cache": lambda: random.randint(0, 1),
         "enable_writes_to_columns_cache": lambda: random.randint(0, 1),
-        # Stop writing to the columns cache partway through a query, or for the whole query.
-        "columns_cache_max_bytes_to_write_to_cache": lambda: random.choice([0, 1, 1024 * 1024, 64 * 1024 * 1024]),
-        "columns_cache_max_estimated_bytes_to_write_to_cache": lambda: random.choice([0, 1, 1024 * 1024, 64 * 1024 * 1024]),
+        # Stop writing to the columns cache partway through a query, or for the whole query. A small limit keeps
+        # the granules that the columns cache tests prime out of the cache (1 byte breaks 25 of them, 1 MiB 5),
+        # so only a limit above what a test writes is drawn.
+        "columns_cache_max_bytes_to_write_to_cache": lambda: random.choice([0, 64 * 1024 * 1024]),
+        "columns_cache_max_estimated_bytes_to_write_to_cache": lambda: random.choice([0, 64 * 1024 * 1024]),
         # More query plan optimizations
         "enable_optimize_predicate_expression_to_final_subquery": lambda: random.random() > 0.05,
         "enable_software_prefetch_in_aggregation": lambda: random.random() > 0.05,
