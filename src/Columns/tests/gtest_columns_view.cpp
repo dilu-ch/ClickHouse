@@ -7,19 +7,15 @@ namespace DB
 namespace
 {
 
-const IColumn * keepNonEmpty(const IColumn * column, const void *)
+const IColumn * identity(const IColumn * column, const void *)
 {
-    return column->empty() ? nullptr : column;
+    return column;
 }
 
-const IColumn * keepSelected(const IColumn * column, const void * context)
+/// Maps every source column to the column in `context`.
+const IColumn * mapToContext(const IColumn *, const void * context)
 {
-    return column == static_cast<const IColumn *>(context) ? column : nullptr;
-}
-
-const IColumn * filterAll(const IColumn *, const void *)
-{
-    return nullptr;
+    return static_cast<const IColumn *>(context);
 }
 
 ColumnRawPtrs collect(const ColumnsView & columns)
@@ -29,37 +25,43 @@ ColumnRawPtrs collect(const ColumnsView & columns)
     return result;
 }
 
-TEST(ColumnsView, FilteredViewIntrospection)
+TEST(ColumnsView, ProjectedViewIntrospection)
 {
-    auto empty_column = ColumnUInt64::create();
     auto first_column = ColumnUInt64::create();
-    first_column->insertValue(1);
     auto second_column = ColumnUInt64::create();
-    second_column->insertValue(2);
-
+    auto mapped_column = ColumnUInt64::create();
     const IColumn * first_column_ptr = first_column.get();
+    const IColumn * mapped_column_ptr = mapped_column.get();
+
     Columns columns;
-    columns.emplace_back(std::move(empty_column));
     columns.emplace_back(std::move(first_column));
     columns.emplace_back(std::move(second_column));
-
     ColumnsView source_columns(columns);
 
-    auto non_empty_columns = source_columns.filterProject(keepNonEmpty);
-    EXPECT_FALSE(non_empty_columns.empty());
-    EXPECT_EQ(non_empty_columns.size(), 2u);
-    EXPECT_FALSE(non_empty_columns.tryGetSingle().has_value());
+    auto projected = source_columns.project(mapToContext, mapped_column_ptr);
+    EXPECT_FALSE(projected.empty());
+    EXPECT_EQ(projected.size(), 2u);
+    EXPECT_FALSE(projected.tryGetSingle().has_value());
+    EXPECT_EQ(collect(projected), (ColumnRawPtrs{mapped_column_ptr, mapped_column_ptr}));
 
-    auto selected_column = source_columns.filterProject(keepSelected, first_column_ptr);
-    EXPECT_FALSE(selected_column.empty());
-    EXPECT_EQ(selected_column.size(), 1u);
-    ASSERT_TRUE(selected_column.tryGetSingle().has_value());
-    EXPECT_EQ(*selected_column.tryGetSingle(), first_column_ptr);
+    /// A projection of a projection of a single column.
+    ColumnsView single_column(columns.front());
+    auto projected_single = single_column.project(identity);
+    auto projected_twice = projected_single.project(mapToContext, mapped_column_ptr);
+    EXPECT_FALSE(projected_twice.empty());
+    EXPECT_EQ(projected_twice.size(), 1u);
+    ASSERT_TRUE(projected_single.tryGetSingle().has_value());
+    EXPECT_EQ(*projected_single.tryGetSingle(), first_column_ptr);
+    ASSERT_TRUE(projected_twice.tryGetSingle().has_value());
+    EXPECT_EQ(*projected_twice.tryGetSingle(), mapped_column_ptr);
 
-    auto empty_view = source_columns.filterProject(filterAll);
-    EXPECT_TRUE(empty_view.empty());
-    EXPECT_EQ(empty_view.size(), 0u);
-    EXPECT_FALSE(empty_view.tryGetSingle().has_value());
+    /// A projection of no columns.
+    ColumnRawPtrs no_column_ptrs;
+    ColumnsView no_columns(no_column_ptrs);
+    auto projected_empty = no_columns.project(identity);
+    EXPECT_TRUE(projected_empty.empty());
+    EXPECT_EQ(projected_empty.size(), 0u);
+    EXPECT_FALSE(projected_empty.tryGetSingle().has_value());
 }
 
 TEST(ColumnsView, GroupColumns)
@@ -97,9 +99,15 @@ TEST(ColumnsView, GroupColumns)
     EXPECT_EQ(groups[3].size(), 0u);
     EXPECT_FALSE(groups[3].tryGetSingle().has_value());
 
-    /// The source columns can be any view, for example a filtered one.
+    /// The source columns can be any view, for example a projected one, and a source column may have no children.
     auto non_empty_groups = groupColumns(
-        source_columns.filterProject(keepNonEmpty), 2, [](const IColumn * column, auto && emit) { emit(column->size() % 2, column); });
+        source_columns.project(identity),
+        2,
+        [](const IColumn * column, auto && emit)
+        {
+            if (!column->empty())
+                emit(column->size() % 2, column);
+        });
     ASSERT_EQ(non_empty_groups.size(), 2u);
     ASSERT_TRUE(non_empty_groups[0].tryGetSingle().has_value());
     EXPECT_EQ(*non_empty_groups[0].tryGetSingle(), column_ptrs[2]);

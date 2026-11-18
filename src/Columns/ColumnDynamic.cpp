@@ -71,9 +71,9 @@ const FormatSettings & getFormatSettings()
 /// has the columns of variant `i` of `column` in the source columns that have it, in the order of the source columns.
 /// Source variants that `column` doesn't have are skipped. The source columns must be Dynamic.
 ///
-/// The groups are materialized on purpose. A lazy `filterProject` per variant would look up the variant in every source,
-/// but the recursive calls on a variant traverse their sources several times, and a nested view repeats the lookups of
-/// its base on every traversal. For example, the `Dynamic` inside an `Array(Dynamic)` variant, which `JSON` uses for
+/// The groups are materialized on purpose. A lazy view of the sources of a variant would look up the variant in every
+/// source, but the recursive calls on a variant traverse their sources several times, and a nested view repeats the
+/// lookups of its base on every traversal. For example, the `Dynamic` inside an `Array(Dynamic)` variant, which `JSON` uses for
 /// arrays of values of different types, traverses its sources once per its own variant. Grouping walks the variants of
 /// every source once and looks them up in the map of `column`, which stays in the cache.
 GroupedColumns groupVariantSourceColumns(const ColumnDynamic & column, const ColumnsView & source_columns)

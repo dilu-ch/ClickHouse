@@ -16,7 +16,6 @@ namespace DB
 /// The referenced storage must outlive the call that receives this range.
 /// Do not store `ColumnsView` or pointers obtained from it.
 /// The view is expected to yield non-null `IColumn` pointers.
-/// Only mappers passed to `filterProject` may return `nullptr`, which means skipping this source column.
 class ColumnsView
 {
     template <typename... Visitors>
@@ -77,23 +76,14 @@ public:
     }
 
     /// The mapper must return a non-null `IColumn` pointer.
-    /// Use `filterProject` when no mapped column exists for some source columns.
+    /// To select the children of the source columns by key, where some source columns may have no child for a key, use
+    /// `groupColumns`.
     ColumnsView project(Mapper mapper_, const void * context_ = nullptr) const &
     {
-        return ColumnsView(ProjectedRange<false>{this, mapper_, context_});
+        return ColumnsView(ProjectedRange{this, mapper_, context_});
     }
 
     ColumnsView project(Mapper, const void * = nullptr) const && = delete;
-
-    /// Like `project`, but skips source columns for which mapper returns `nullptr`.
-    /// Every traversal calls the mapper for every source column. To select the children of the source columns by key for
-    /// many keys (one `filterProject` per key costs keys * sources mapper calls), use `groupColumns` instead.
-    ColumnsView filterProject(Mapper mapper_, const void * context_ = nullptr) const &
-    {
-        return ColumnsView(ProjectedRange<true>{this, mapper_, context_});
-    }
-
-    ColumnsView filterProject(Mapper, const void * = nullptr) const && = delete;
 
     template <typename Callback>
     bool forEach(Callback && callback) const
@@ -145,35 +135,12 @@ public:
                     return range.columns[0];
                 },
                 [](const SingleRawPtr & range) -> std::optional<const IColumn *> { return range.column; },
-                [](const ProjectedRange<false> & range) -> std::optional<const IColumn *>
+                [](const ProjectedRange & range) -> std::optional<const IColumn *>
                 {
                     std::optional<const IColumn *> base_column = range.base->tryGetSingle();
                     if (!base_column)
                         return std::nullopt;
                     return range.mapper(*base_column, range.context);
-                },
-                [&](const ProjectedRange<true> &) -> std::optional<const IColumn *>
-                {
-                    std::optional<const IColumn *> result;
-                    bool found_more = false;
-
-                    forEach(
-                        [&](const IColumn * current)
-                        {
-                            if (!result)
-                            {
-                                result = current;
-                                return true;
-                            }
-
-                            found_more = true;
-                            return false;
-                        });
-
-                    if (result && !found_more)
-                        return result;
-
-                    return std::nullopt;
                 },
             },
             storage);
@@ -186,13 +153,7 @@ public:
                 [](const ColumnPtrRange & range) -> size_t { return range.num_columns; },
                 [](const RawPtrRange & range) -> size_t { return range.num_columns; },
                 [](const SingleRawPtr &) -> size_t { return 1; },
-                [](const ProjectedRange<false> & range) -> size_t { return range.base->size(); },
-                [&](const ProjectedRange<true> &) -> size_t
-                {
-                    size_t num_columns = 0;
-                    forEach([&](const IColumn *) { ++num_columns; });
-                    return num_columns;
-                },
+                [](const ProjectedRange & range) -> size_t { return range.base->size(); },
             },
             storage);
     }
@@ -204,18 +165,7 @@ public:
                 [](const ColumnPtrRange & range) -> bool { return range.num_columns == 0; },
                 [](const RawPtrRange & range) -> bool { return range.num_columns == 0; },
                 [](const SingleRawPtr &) -> bool { return false; },
-                [](const ProjectedRange<false> & range) -> bool { return range.base->empty(); },
-                [&](const ProjectedRange<true> &) -> bool
-                {
-                    bool is_empty = true;
-                    forEach(
-                        [&](const IColumn *)
-                        {
-                            is_empty = false;
-                            return false;
-                        });
-                    return is_empty;
-                },
+                [](const ProjectedRange & range) -> bool { return range.base->empty(); },
             },
             storage);
     }
@@ -238,20 +188,16 @@ private:
         const IColumn * column = nullptr;
     };
 
-    template <bool is_filtered>
     struct ProjectedRange
     {
-        static constexpr bool filtered = is_filtered;
-
         const ColumnsView * base;
         Mapper mapper;
         const void * context;
     };
 
-    using Storage = std::variant<RawPtrRange, ColumnPtrRange, SingleRawPtr, ProjectedRange<false>, ProjectedRange<true>>;
+    using Storage = std::variant<RawPtrRange, ColumnPtrRange, SingleRawPtr, ProjectedRange>;
 
-    template <bool is_filtered>
-    explicit ColumnsView(ProjectedRange<is_filtered> projected_)
+    explicit ColumnsView(ProjectedRange projected_)
         : storage(projected_)
     {
     }
@@ -303,7 +249,7 @@ private:
                     return true;
                 },
                 [&](const SingleRawPtr & range) -> bool { return callback(range.column, callback_context); },
-                [&](const ProjectedRange<false> & range) -> bool
+                [&](const ProjectedRange & range) -> bool
                 {
                     ProjectedCallbackContext context{range.mapper, range.context, callback, callback_context};
 
@@ -313,21 +259,6 @@ private:
                             const auto & typed_context = *static_cast<const ProjectedCallbackContext *>(opaque_context);
                             return typed_context.callback(
                                 typed_context.mapper(column, typed_context.mapper_context), typed_context.callback_context);
-                        },
-                        &context);
-                },
-                [&](const ProjectedRange<true> & range) -> bool
-                {
-                    ProjectedCallbackContext context{range.mapper, range.context, callback, callback_context};
-
-                    return range.base->forEachImpl(
-                        [](const IColumn * column, void * opaque_context)
-                        {
-                            const auto & typed_context = *static_cast<const ProjectedCallbackContext *>(opaque_context);
-                            const IColumn * mapped_column = typed_context.mapper(column, typed_context.mapper_context);
-                            if (!mapped_column)
-                                return true;
-                            return typed_context.callback(mapped_column, typed_context.callback_context);
                         },
                         &context);
                 },
@@ -376,9 +307,9 @@ private:
 /// group, with `group` < `num_groups` and non-null `child`. A source column may have children in any number of groups.
 /// Every group keeps the order of the source columns.
 ///
-/// Use it instead of one `filterProject` per key when the children are selected by key (e.g. by name in a hash map)
-/// for many keys: that costs keys * sources lookups, mostly misses when every source has only a few of the keys,
-/// while grouping costs one lookup per existing child.
+/// Use it when the children are selected by key (e.g. by name in a hash map) for many keys: looking up every key in every
+/// source costs keys * sources lookups, mostly misses when every source has only a few of the keys, while grouping costs
+/// one lookup per existing child. The groups are materialized, so traversing them doesn't repeat the lookups.
 template <typename Children>
 GroupedColumns groupColumns(const ColumnsView & source_columns, size_t num_groups, Children && children)
 {
