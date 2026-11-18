@@ -1965,11 +1965,14 @@ void ColumnVariant::chooseDynamicStructureForMerge(const ColumnsView & source_co
     /// `getVariantSourceColumnByGlobalDiscriminator` below relies on this check.
     source_columns.forEach([&](const IColumn * source_column) { getSourceVariantColumn(*source_column, *this, "merge"); });
 
+    /// For the variants without dynamic structure it does nothing.
     size_t num_variants = variants.size();
     for (size_t i = 0; i != num_variants; ++i)
     {
-        getVariantByGlobalDiscriminator(i).chooseDynamicStructureForMerge(
-            source_columns.project(getVariantSourceColumnByGlobalDiscriminator, &i), max_dynamic_subcolumns);
+        auto & variant = getVariantByGlobalDiscriminator(i);
+        if (variant.hasDynamicStructure())
+            variant.chooseDynamicStructureForMerge(
+                source_columns.project(getVariantSourceColumnByGlobalDiscriminator, &i), max_dynamic_subcolumns);
     }
 }
 
@@ -2037,10 +2040,12 @@ void ColumnVariant::takeOrCalculateStatisticsFrom(const ColumnsView & source_col
 
     /// Iterate by global discriminator: source columns are addressed by global discriminator,
     /// so the destination variant must be too (local order may differ from global order).
+    /// For the variants without statistics it does nothing.
     for (size_t i = 0; i != variants.size(); ++i)
     {
-        getVariantByGlobalDiscriminator(i).takeOrCalculateStatisticsFrom(
-            source_columns.project(getVariantSourceColumnByGlobalDiscriminator, &i));
+        auto & variant = getVariantByGlobalDiscriminator(i);
+        if (variant.hasStatistics())
+            variant.takeOrCalculateStatisticsFrom(source_columns.project(getVariantSourceColumnByGlobalDiscriminator, &i));
     }
 }
 

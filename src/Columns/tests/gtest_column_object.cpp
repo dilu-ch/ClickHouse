@@ -7,8 +7,8 @@
 #include <Columns/ColumnTuple.h>
 #include <Columns/ColumnVariant.h>
 #include <Columns/ColumnsView.h>
-#include <DataTypes/DataTypeDynamic.h>
 #include <DataTypes/DataTypeFactory.h>
+#include <DataTypes/DataTypeDynamic.h>
 #include <DataTypes/DataTypeNothing.h>
 #include <DataTypes/DataTypesBinaryEncoding.h>
 #include <IO/ReadBufferFromMemory.h>
@@ -778,3 +778,87 @@ TEST(ColumnObject, ChooseDynamicStructureAndTakeStatisticsFromSparseSources)
     check_variants("b", {{"String", 1}, {"Int64", 2}});
     check_variants("c", {{"Array(UInt64)", 1}, {"String", 3}});
 }
+
+TEST(ColumnObject, ChooseDynamicStructureAndTakeStatisticsForTypedPaths)
+{
+    /// The typed path `d` has dynamic structure and statistics, `m` has statistics, `n` has neither.
+    /// The numbers need 64 bits, so that their types are UInt64, not the smallest types that fit.
+    auto type
+        = DataTypeFactory::instance().get("JSON(max_dynamic_types=10, max_dynamic_paths=10, d Dynamic, m Map(String, UInt64), n UInt64)");
+
+    auto first_source = type->createColumn();
+    first_source->insert(
+        Object{{"d", Field(UInt64(10'000'000'001))}, {"m", Map{Tuple{Field("a"), Field(UInt64(1))}}}, {"n", Field(UInt64(1))}});
+
+    auto second_source = type->createColumn();
+    second_source->insert(
+        Object{
+            {"d", Field("second")},
+            {"m", Map{Tuple{Field("b"), Field(UInt64(2))}, Tuple{Field("c"), Field(UInt64(3))}}},
+            {"n", Field(UInt64(2))}});
+    second_source->insert(Object{{"d", Field("third")}, {"n", Field(UInt64(3))}});
+
+    VectorWithMemoryTracking<ColumnPtr> sources;
+    sources.emplace_back(std::move(first_source));
+    sources.emplace_back(std::move(second_source));
+
+    auto result = type->createColumn();
+    result->chooseDynamicStructureForMerge(sources, std::nullopt);
+    result->takeOrCalculateStatisticsFrom(sources);
+
+    const auto & result_object = assert_cast<const ColumnObject &>(*result);
+    const auto & typed_dynamic = assert_cast<const ColumnDynamic &>(*result_object.getTypedPaths().at("d"));
+    /// The variants of the typed path in all sources, and the shared variant.
+    EXPECT_EQ(typed_dynamic.getVariantInfo().variant_name, "Variant(SharedVariant, String, UInt64)");
+    ASSERT_TRUE(typed_dynamic.getStatistics());
+    EXPECT_EQ(typed_dynamic.getStatistics()->variants_statistics.at("String"), 2u);
+    EXPECT_EQ(typed_dynamic.getStatistics()->variants_statistics.at("UInt64"), 1u);
+
+    /// 3 maps with 3 elements.
+    const auto & typed_map = assert_cast<const ColumnMap &>(*result_object.getTypedPaths().at("m"));
+    ASSERT_TRUE(typed_map.getStatistics());
+    EXPECT_EQ(typed_map.getStatistics()->count, 3u);
+    EXPECT_DOUBLE_EQ(typed_map.getStatistics()->avg, 1.0);
+
+    /// A single source, as for every block written to a part.
+    auto single_source_result = type->createColumn();
+    single_source_result->takeExactDynamicStructureFrom(*sources.back());
+    single_source_result->takeOrCalculateStatisticsFrom(sources.back());
+
+    const auto & single_source_object = assert_cast<const ColumnObject &>(*single_source_result);
+    const auto & single_source_dynamic = assert_cast<const ColumnDynamic &>(*single_source_object.getTypedPaths().at("d"));
+    ASSERT_TRUE(single_source_dynamic.getStatistics());
+    EXPECT_EQ(single_source_dynamic.getStatistics()->variants_statistics.at("String"), 2u);
+    EXPECT_FALSE(single_source_dynamic.getStatistics()->variants_statistics.contains("UInt64"));
+
+    const auto & single_source_map = assert_cast<const ColumnMap &>(*single_source_object.getTypedPaths().at("m"));
+    ASSERT_TRUE(single_source_map.getStatistics());
+    EXPECT_EQ(single_source_map.getStatistics()->count, 2u);
+    EXPECT_DOUBLE_EQ(single_source_map.getStatistics()->avg, 1.0);
+}
+
+/// Skipped under debug/sanitizers: LOGICAL_ERROR aborts there, so the exception can't be caught.
+#ifndef DEBUG_OR_SANITIZER_BUILD
+
+TEST(ColumnObject, SourcesWithOtherTypedPathsAreRejected)
+{
+    auto target_type = DataTypeFactory::instance().get("JSON(a UInt64, b String)");
+    for (const auto * source_type_name : {"JSON(a UInt64, c String)", "JSON(a UInt64)", "JSON(a UInt64, b String, c String)"})
+    {
+        SCOPED_TRACE(source_type_name);
+        auto source_type = DataTypeFactory::instance().get(source_type_name);
+        auto source = source_type->createColumn();
+        source->insert(Object{{"a", Field(UInt64(1))}});
+
+        VectorWithMemoryTracking<ColumnPtr> single_source;
+        single_source.push_back(source->getPtr());
+        EXPECT_THROW(target_type->createColumn()->prepareForSquashing(single_source, 1), Exception);
+
+        VectorWithMemoryTracking<ColumnPtr> two_sources;
+        two_sources.push_back(source->getPtr());
+        two_sources.push_back(source->getPtr());
+        EXPECT_THROW(target_type->createColumn()->prepareForSquashing(two_sources, 1), Exception);
+    }
+}
+
+#endif

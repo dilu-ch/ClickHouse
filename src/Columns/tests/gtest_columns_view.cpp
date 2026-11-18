@@ -40,8 +40,7 @@ TEST(ColumnsView, ProjectedViewIntrospection)
 
     auto projected = source_columns.project(mapToContext, mapped_column_ptr);
     EXPECT_FALSE(projected.empty());
-    EXPECT_EQ(projected.size(), 2u);
-    EXPECT_FALSE(projected.tryGetSingle().has_value());
+    EXPECT_EQ(projected.tryGetSingle(), nullptr);
     EXPECT_EQ(collect(projected), (ColumnRawPtrs{mapped_column_ptr, mapped_column_ptr}));
 
     /// A projection of a projection of a single column.
@@ -49,19 +48,23 @@ TEST(ColumnsView, ProjectedViewIntrospection)
     auto projected_single = single_column.project(identity);
     auto projected_twice = projected_single.project(mapToContext, mapped_column_ptr);
     EXPECT_FALSE(projected_twice.empty());
-    EXPECT_EQ(projected_twice.size(), 1u);
-    ASSERT_TRUE(projected_single.tryGetSingle().has_value());
-    EXPECT_EQ(*projected_single.tryGetSingle(), first_column_ptr);
-    ASSERT_TRUE(projected_twice.tryGetSingle().has_value());
-    EXPECT_EQ(*projected_twice.tryGetSingle(), mapped_column_ptr);
+    EXPECT_EQ(projected_single.tryGetSingle(), first_column_ptr);
+    EXPECT_EQ(projected_twice.tryGetSingle(), mapped_column_ptr);
+    EXPECT_EQ(collect(projected_twice), (ColumnRawPtrs{mapped_column_ptr}));
 
     /// A projection of no columns.
     ColumnRawPtrs no_column_ptrs;
     ColumnsView no_columns(no_column_ptrs);
     auto projected_empty = no_columns.project(identity);
     EXPECT_TRUE(projected_empty.empty());
-    EXPECT_EQ(projected_empty.size(), 0u);
-    EXPECT_FALSE(projected_empty.tryGetSingle().has_value());
+    EXPECT_EQ(projected_empty.tryGetSingle(), nullptr);
+    EXPECT_TRUE(collect(projected_empty).empty());
+
+    /// A single raw pointer.
+    ColumnsView single_raw_ptr(first_column_ptr);
+    EXPECT_FALSE(single_raw_ptr.empty());
+    EXPECT_EQ(single_raw_ptr.tryGetSingle(), first_column_ptr);
+    EXPECT_EQ(collect(single_raw_ptr.project(mapToContext, mapped_column_ptr)), (ColumnRawPtrs{mapped_column_ptr}));
 }
 
 TEST(ColumnsView, GroupColumns)
@@ -93,11 +96,9 @@ TEST(ColumnsView, GroupColumns)
     EXPECT_EQ(collect(groups[0]), (ColumnRawPtrs{column_ptrs[0], column_ptrs[2]}));
     EXPECT_EQ(collect(groups[1]), (ColumnRawPtrs{column_ptrs[1], column_ptrs[3]}));
     EXPECT_EQ(collect(groups[2]), column_ptrs);
-    EXPECT_EQ(groups[2].size(), 4u);
-    EXPECT_FALSE(groups[2].tryGetSingle().has_value());
+    EXPECT_EQ(groups[2].tryGetSingle(), nullptr);
     EXPECT_TRUE(groups[3].empty());
-    EXPECT_EQ(groups[3].size(), 0u);
-    EXPECT_FALSE(groups[3].tryGetSingle().has_value());
+    EXPECT_EQ(groups[3].tryGetSingle(), nullptr);
 
     /// The source columns can be any view, for example a projected one, and a source column may have no children.
     auto non_empty_groups = groupColumns(
@@ -109,8 +110,7 @@ TEST(ColumnsView, GroupColumns)
                 emit(column->size() % 2, column);
         });
     ASSERT_EQ(non_empty_groups.size(), 2u);
-    ASSERT_TRUE(non_empty_groups[0].tryGetSingle().has_value());
-    EXPECT_EQ(*non_empty_groups[0].tryGetSingle(), column_ptrs[2]);
+    EXPECT_EQ(non_empty_groups[0].tryGetSingle(), column_ptrs[2]);
     EXPECT_EQ(collect(non_empty_groups[1]), (ColumnRawPtrs{column_ptrs[1], column_ptrs[3]}));
 
     /// Without groups the children of the source columns are not visited.

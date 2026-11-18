@@ -22,9 +22,9 @@
 #include <Columns/ColumnVector.h>
 #include <Columns/ColumnsCommon.h>
 #include <Columns/ColumnsView.h>
+#include <Columns/findEqualRangeEndAssumeSorted.h>
 #include <Columns/IColumnDummy.h>
 #include <Columns/IColumn_fwd.h>
-#include <Columns/findEqualRangeEndAssumeSorted.h>
 #include <Core/Block.h>
 #include <Core/Field.h>
 #include <DataTypes/Serializations/SerializationInfo.h>

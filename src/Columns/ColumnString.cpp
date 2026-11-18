@@ -2,15 +2,15 @@
 
 #include <cstring>
 #include <Columns/Collator.h>
+#include <Columns/findEqualRangeEndAssumeSorted.h>
+#include <Columns/ColumnsCommon.h>
 #include <Columns/ColumnCompressed.h>
 #include <Columns/ColumnConst.h>
-#include <Columns/ColumnsCommon.h>
 #include <Columns/ColumnsNumber.h>
 #include <Columns/ColumnsView.h>
-#include <Columns/findEqualRangeEndAssumeSorted.h>
 #include <Common/Arena.h>
-#include <Common/HashTable/Hash.h>
 #include <Common/HashTable/StringHashSet.h>
+#include <Common/HashTable/Hash.h>
 #include <Common/SipHash.h>
 #include <Common/assert_cast.h>
 #include <Common/typeid_cast.h>

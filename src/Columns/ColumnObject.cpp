@@ -18,6 +18,8 @@
 #include <Common/checkStackSize.h>
 #include <Common/logger_useful.h>
 
+#include <algorithm>
+
 namespace DB
 {
 
@@ -70,31 +72,70 @@ const IColumn * getObjectSharedDataSourceColumn(const IColumn * source_column, c
     return assert_cast<const ColumnObject &>(*source_column).getSharedDataPtr().get();
 }
 
-const IColumn * getObjectTypedPathSourceColumn(const IColumn * source_column, const void * context)
+/// Which paths of the source Object columns `forEachPathWithSourceColumns` matches with the paths of the column.
+enum class ObjectPathKind : uint8_t
 {
-    const auto & path = *static_cast<const String *>(context);
-    return assert_cast<const ColumnObject &>(*source_column).getTypedPaths().at(path).get();
+    /// The typed paths are a part of the type, so every source column has exactly the typed paths of the column.
+    Typed,
+    /// Every source column has its own dynamic paths, often only a few of the dynamic paths of the column.
+    Dynamic,
+};
+
+const auto & getObjectPaths(const ColumnObject & column, ObjectPathKind kind)
+{
+    return kind == ObjectPathKind::Typed ? column.getTypedPaths() : column.getDynamicPaths();
 }
 
-/// Calls `callback(dynamic_path_column, path_source_columns)` for every dynamic path of `column`, where
-/// `path_source_columns` are the columns of this path in the source Object columns that have it, in the order of the
-/// source columns. It walks the dynamic paths of every source column and looks them up among the dynamic paths of
-/// `column`, instead of looking up every dynamic path of `column` in every source column: with sparse JSON a source
-/// column has only a few of the resulting paths, and most of those lookups would be misses.
-template <typename Callback>
-void forEachDynamicPathWithSourceColumns(ColumnObject & column, const ColumnsView & source_columns, Callback && callback)
+[[noreturn]] void throwSourceTypedPathsMismatch(const ColumnObject & source_column)
 {
-    auto & dynamic_paths_ptrs = column.getDynamicPathsPtrs();
-    if (dynamic_paths_ptrs.empty())
+    throw Exception(
+        ErrorCodes::LOGICAL_ERROR, "Source column {} doesn't have the same typed paths as the resulting column", source_column.getName());
+}
+
+/// Calls `callback(path_column, path_source_columns)` for every path in `paths`, the typed or the dynamic paths of an Object
+/// column, where `path_source_columns` are the columns of this path in the source Object columns that have it, in the order
+/// of the source columns. The source columns must be Object.
+///
+/// It walks the paths of every source column and looks them up in `paths`, instead of looking up every path in every source
+/// column: with sparse JSON a source column has only a few of the resulting dynamic paths, and most of those lookups would
+/// be misses. The source columns of every path are materialized, so that the recursive calls on the path columns, which
+/// traverse their sources several times and at every nesting level, don't repeat the lookups.
+template <typename Paths, typename Callback>
+void forEachPathWithSourceColumns(Paths & paths, ObjectPathKind kind, const ColumnsView & source_columns, Callback && callback)
+{
+    if (paths.empty())
         return;
 
-    /// Open addressing: one allocation instead of one per path. The map carries the group index together with the
-    /// dynamic path column, so the callback loop below reads both from the same cell and cannot misalign them.
-    HashMapWithSavedHash<std::string_view, std::pair<size_t, ColumnDynamic *>, StringViewHash> path_to_group(dynamic_paths_ptrs.size());
-    for (const auto & [path, dynamic_path_column] : dynamic_paths_ptrs)
+    /// A single source column, for example the block that the writer of a part takes the statistics from: look up the paths
+    /// in it directly instead of materializing the groups.
+    if (const IColumn * single_source_column = source_columns.tryGetSingle())
+    {
+        const auto & source_object = assert_cast<const ColumnObject &>(*single_source_column);
+        const auto & source_paths = getObjectPaths(source_object, kind);
+        if (kind == ObjectPathKind::Typed && source_paths.size() != paths.size())
+            throwSourceTypedPathsMismatch(source_object);
+
+        for (auto & [path, path_column] : paths)
+        {
+            auto it = source_paths.find(path);
+            if (it != source_paths.end())
+                callback(*path_column, ColumnsView(it->second.get()));
+            else if (kind == ObjectPathKind::Typed)
+                throwSourceTypedPathsMismatch(source_object);
+            else
+                callback(*path_column, ColumnsView(std::span<const IColumn * const>()));
+        }
+        return;
+    }
+
+    /// Open addressing: one allocation instead of one per path. The map carries the group index together with the path
+    /// column, so the callback loop below reads both from the same cell and cannot misalign them.
+    using PathColumn = std::remove_reference_t<decltype(*paths.begin()->second)>;
+    HashMapWithSavedHash<std::string_view, std::pair<size_t, PathColumn *>, StringViewHash> path_to_group(paths.size());
+    for (auto & [path, path_column] : paths)
     {
         const size_t group = path_to_group.size();
-        path_to_group[path] = {group, dynamic_path_column};
+        path_to_group[path] = {group, &*path_column};
     }
 
     const auto path_source_columns = groupColumns(
@@ -102,17 +143,24 @@ void forEachDynamicPathWithSourceColumns(ColumnObject & column, const ColumnsVie
         path_to_group.size(),
         [&](const IColumn * source_column, auto && emit)
         {
-            for (const auto & [path, source_path_column] : assert_cast<const ColumnObject &>(*source_column).getDynamicPaths())
+            const auto & source_object = assert_cast<const ColumnObject &>(*source_column);
+            const auto & source_paths = getObjectPaths(source_object, kind);
+            if (kind == ObjectPathKind::Typed && source_paths.size() != paths.size())
+                throwSourceTypedPathsMismatch(source_object);
+
+            for (const auto & [path, source_path_column] : source_paths)
             {
                 if (const auto * it = path_to_group.find(path))
                     emit(it->getMapped().first, source_path_column.get());
+                else if (kind == ObjectPathKind::Typed)
+                    throwSourceTypedPathsMismatch(source_object);
             }
         });
 
     for (auto & cell : path_to_group)
     {
-        const auto & [group, dynamic_path_column] = cell.getMapped();
-        callback(*dynamic_path_column, path_source_columns[group]);
+        const auto & [group, path_column] = cell.getMapped();
+        callback(*path_column, path_source_columns[group]);
     }
 }
 
@@ -1595,8 +1643,8 @@ ColumnPtr ColumnObject::replicate(const Offsets & replicate_offsets) const
 VectorWithMemoryTracking<MutableColumnPtr> ColumnObject::scatter(size_t num_columns, const Selector & selector) const
 {
     VectorWithMemoryTracking<UnorderedMapWithMemoryTracking<String, MutableColumnPtr>> scattered_typed_paths(num_columns);
-    for (auto & scattered_paths : scattered_typed_paths)
-        scattered_paths.reserve(typed_paths.size());
+    for (auto & typed_paths_ : scattered_typed_paths)
+        typed_paths_.reserve(typed_paths.size());
 
     for (const auto & [path, column] : typed_paths)
     {
@@ -1606,8 +1654,8 @@ VectorWithMemoryTracking<MutableColumnPtr> ColumnObject::scatter(size_t num_colu
     }
 
     VectorWithMemoryTracking<UnorderedMapWithMemoryTracking<String, MutableColumnPtr>> scattered_dynamic_paths(num_columns);
-    for (auto & scattered_paths : scattered_dynamic_paths)
-        scattered_paths.reserve(dynamic_paths_ptrs.size());
+    for (auto & dynamic_paths_ : scattered_dynamic_paths)
+        dynamic_paths_.reserve(dynamic_paths_ptrs.size());
 
     for (const auto & [path, column] : dynamic_paths_ptrs)
     {
@@ -2017,11 +2065,15 @@ void ColumnObject::prepareForSquashing(const ColumnsView & source_columns, size_
 
     shared_data->prepareForSquashing(source_columns.project(getObjectSharedDataSourceColumn), factor);
 
-    for (auto & [path, column] : typed_paths)
-        column->prepareForSquashing(source_columns.project(getObjectTypedPathSourceColumn, &path), factor);
+    forEachPathWithSourceColumns(
+        typed_paths,
+        ObjectPathKind::Typed,
+        source_columns,
+        [&](IColumn & column, const ColumnsView & path_source_columns) { column.prepareForSquashing(path_source_columns, factor); });
 
-    forEachDynamicPathWithSourceColumns(
-        *this,
+    forEachPathWithSourceColumns(
+        dynamic_paths_ptrs,
+        ObjectPathKind::Dynamic,
         source_columns,
         [&](ColumnDynamic & column, const ColumnsView & path_source_columns)
         {
@@ -2161,15 +2213,26 @@ void ColumnObject::chooseDynamicStructureForMerge(const ColumnsView & source_col
     /// Now we have the resulting set of dynamic paths that will be used in all merged columns.
     /// As we use Dynamic column for dynamic paths, we should call `chooseDynamicStructureForMerge`
     /// on all resulting dynamic columns.
-    forEachDynamicPathWithSourceColumns(
-        *this,
+    forEachPathWithSourceColumns(
+        dynamic_paths_ptrs,
+        ObjectPathKind::Dynamic,
         source_columns,
         [&](ColumnDynamic & column, const ColumnsView & path_source_columns)
         { column.chooseDynamicStructureForMerge(path_source_columns, max_dynamic_subcolumns); });
 
-    /// Typed paths also can contain types with dynamic structure.
-    for (auto & [path, column] : typed_paths)
-        column->chooseDynamicStructureForMerge(source_columns.project(getObjectTypedPathSourceColumn, &path), max_dynamic_subcolumns);
+    /// Typed paths also can contain types with dynamic structure. For the other typed paths it does nothing.
+    if (!std::ranges::any_of(typed_paths, [](const auto & typed_path) { return typed_path.second->hasDynamicStructure(); }))
+        return;
+
+    forEachPathWithSourceColumns(
+        typed_paths,
+        ObjectPathKind::Typed,
+        source_columns,
+        [&](IColumn & column, const ColumnsView & path_source_columns)
+        {
+            if (column.hasDynamicStructure())
+                column.chooseDynamicStructureForMerge(path_source_columns, max_dynamic_subcolumns);
+        });
 }
 
 void ColumnObject::takeExactDynamicStructureFrom(const IColumn & source)
@@ -2236,11 +2299,39 @@ void ColumnObject::takeOrCalculateStatisticsFrom(const ColumnsView & source_colu
     /// The traversals of `source_columns` below rely on this check.
     source_columns.forEach([&](const IColumn * source_column) { getSourceObjectColumn(*source_column, *this, "statistics"); });
 
+    /// Recursively update statistics for the dynamic paths and the typed paths with statistics.
+    auto take_paths_statistics = [&]
+    {
+        forEachPathWithSourceColumns(
+            dynamic_paths_ptrs,
+            ObjectPathKind::Dynamic,
+            source_columns,
+            [&](ColumnDynamic & column, const ColumnsView & path_source_columns)
+            {
+                if (!path_source_columns.empty())
+                    column.takeOrCalculateStatisticsFrom(path_source_columns);
+            });
+
+        /// For the typed paths without statistics it does nothing.
+        if (!std::ranges::any_of(typed_paths, [](const auto & typed_path) { return typed_path.second->hasStatistics(); }))
+            return;
+
+        forEachPathWithSourceColumns(
+            typed_paths,
+            ObjectPathKind::Typed,
+            source_columns,
+            [&](IColumn & column, const ColumnsView & path_source_columns)
+            {
+                if (column.hasStatistics())
+                    column.takeOrCalculateStatisticsFrom(path_source_columns);
+            });
+    };
+
     /// The writer of a part takes the statistics from its sample column for every block. When the statistics of the
     /// only source already match our dynamic paths, the code below would build an exact copy of them, so share them.
-    if (std::optional<const IColumn *> single_source_column = source_columns.tryGetSingle(); single_source_column)
+    if (const IColumn * single_source_column = source_columns.tryGetSingle())
     {
-        const auto & source_object = assert_cast<const ColumnObject &>(**single_source_column);
+        const auto & source_object = assert_cast<const ColumnObject &>(*single_source_column);
         auto source_statistics = source_object.getOrCalculateStatistics();
         bool can_share = source_statistics->shared_data_paths_statistics.size() <= Statistics::MAX_SHARED_DATA_STATISTICS_SIZE;
         for (const auto & [path, _] : source_statistics->dynamic_paths_statistics)
@@ -2251,14 +2342,7 @@ void ColumnObject::takeOrCalculateStatisticsFrom(const ColumnsView & source_colu
         if (can_share)
         {
             statistics = std::move(source_statistics);
-            for (auto & [path, column] : dynamic_paths)
-            {
-                auto it = source_object.dynamic_paths.find(path);
-                if (it != source_object.dynamic_paths.end())
-                    column->takeOrCalculateStatisticsFrom(it->second.get());
-            }
-            for (auto & [path, column] : typed_paths)
-                column->takeOrCalculateStatisticsFrom(source_object.typed_paths.at(path).get());
+            take_paths_statistics();
             return;
         }
     }
@@ -2311,42 +2395,7 @@ void ColumnObject::takeOrCalculateStatisticsFrom(const ColumnsView & source_colu
     }
 
     statistics = std::make_shared<const Statistics>(std::move(new_statistics));
-
-    /// Recursively update statistics for nested dynamic paths.
-    if (std::optional<const IColumn *> single_source_column = source_columns.tryGetSingle(); single_source_column)
-    {
-        const IColumn * source_column = *single_source_column;
-        const auto & source_object = assert_cast<const ColumnObject &>(*source_column);
-        for (auto & [path, column] : dynamic_paths)
-        {
-            auto it = source_object.dynamic_paths.find(path);
-            if (it == source_object.dynamic_paths.end())
-                continue;
-
-            const ColumnPtr & source_path_column = it->second;
-            column->takeOrCalculateStatisticsFrom(source_path_column);
-        }
-
-        for (auto & [path, column] : typed_paths)
-        {
-            const ColumnPtr & source_path_column = source_object.typed_paths.at(path);
-            column->takeOrCalculateStatisticsFrom(source_path_column);
-        }
-        return;
-    }
-
-    forEachDynamicPathWithSourceColumns(
-        *this,
-        source_columns,
-        [&](ColumnDynamic & column, const ColumnsView & path_source_columns)
-        {
-            if (!path_source_columns.empty())
-                column.takeOrCalculateStatisticsFrom(path_source_columns);
-        });
-
-    /// Recursively update statistics for typed paths.
-    for (auto & [path, column] : typed_paths)
-        column->takeOrCalculateStatisticsFrom(source_columns.project(getObjectTypedPathSourceColumn, &path));
+    take_paths_statistics();
 }
 
 size_t ColumnObject::findPathLowerBoundInSharedData(std::string_view path, const ColumnString & shared_data_paths, size_t start, size_t end)

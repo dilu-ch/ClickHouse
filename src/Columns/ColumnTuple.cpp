@@ -988,8 +988,12 @@ void ColumnTuple::chooseDynamicStructureForMerge(const ColumnsView & source_colu
 {
     checkSourceTupleColumns(source_columns, *this, "merge");
 
+    /// For the elements without dynamic structure it does nothing.
     for (size_t i = 0; i != columns.size(); ++i)
-        columns[i]->chooseDynamicStructureForMerge(source_columns.project(getTupleElementSourceColumn, &i), max_dynamic_subcolumns);
+    {
+        if (columns[i]->hasDynamicStructure())
+            columns[i]->chooseDynamicStructureForMerge(source_columns.project(getTupleElementSourceColumn, &i), max_dynamic_subcolumns);
+    }
 }
 
 void ColumnTuple::takeExactDynamicStructureFrom(const IColumn & source)
@@ -1017,12 +1021,14 @@ void ColumnTuple::takeOrCalculateStatisticsFrom(const ColumnsView & source_colum
 {
     checkSourceTupleColumns(source_columns, *this, "statistics");
 
+    /// For the elements without statistics it does nothing.
     for (size_t i = 0; i != columns.size(); ++i)
     {
         if (!columns[i])
             throw Exception(ErrorCodes::LOGICAL_ERROR, "Column {} of tuple is invalid", i);
 
-        columns[i]->takeOrCalculateStatisticsFrom(source_columns.project(getTupleElementSourceColumn, &i));
+        if (columns[i]->hasStatistics())
+            columns[i]->takeOrCalculateStatisticsFrom(source_columns.project(getTupleElementSourceColumn, &i));
     }
 }
 

@@ -3,7 +3,7 @@
 #include <Columns/IColumn_fwd.h>
 #include <base/defines.h>
 
-#include <optional>
+#include <memory>
 #include <span>
 #include <type_traits>
 #include <utility>
@@ -13,20 +13,11 @@ namespace DB
 {
 
 /// Non-owning borrowed view over source columns.
-/// The referenced storage must outlive the call that receives this range.
+/// The referenced storage must outlive the call that receives this view.
 /// Do not store `ColumnsView` or pointers obtained from it.
 /// The view is expected to yield non-null `IColumn` pointers.
 class ColumnsView
 {
-    template <typename... Visitors>
-    struct Overloaded : Visitors...
-    {
-        using Visitors::operator()...;
-    };
-
-    template <typename... Visitors>
-    Overloaded(Visitors...) -> Overloaded<Visitors...>;
-
 public:
     /// Mappers are evaluated lazily and can run multiple times while traversing nested views.
     /// They must be cheap and pure, and must not return pointers to temporary objects.
@@ -53,11 +44,6 @@ public:
 
     ColumnsView(VectorWithMemoryTracking<ColumnPtr> &&) = delete;
 
-    explicit ColumnsView(std::span<const ColumnPtr> columns_)
-        : storage(ColumnPtrRange{columns_.data(), columns_.size()})
-    {
-    }
-
     ColumnsView(const ColumnRawPtrs & columns_) // NOLINT(google-explicit-constructor)
         : storage(RawPtrRange{columns_.data(), columns_.size()})
     {
@@ -75,6 +61,10 @@ public:
     {
     }
 
+    ColumnsView(const ColumnsView &) = default;
+    /// A projected view points to its base, so `view = view.project(...)` would make the view its own base.
+    ColumnsView & operator=(const ColumnsView &) = delete;
+
     /// The mapper must return a non-null `IColumn` pointer.
     /// To select the children of the source columns by key, where some source columns may have no child for a key, use
     /// `groupColumns`.
@@ -85,89 +75,52 @@ public:
 
     ColumnsView project(Mapper, const void * = nullptr) const && = delete;
 
+    /// Calls `callback(column)` for every column of the view, in order.
     template <typename Callback>
-    bool forEach(Callback && callback) const
+    void forEach(Callback && callback) const
     {
-        if (const auto * range = std::get_if<ColumnPtrRange>(&storage))
-        {
-            for (size_t i = 0; i != range->num_columns; ++i)
-            {
-                if (!invokeCallback(callback, range->columns[i].get()))
-                    return false;
-            }
-            return true;
-        }
+        static_assert(std::is_void_v<std::invoke_result_t<Callback &, const IColumn *>>, "The callback of forEach must return void");
 
-        if (const auto * range = std::get_if<RawPtrRange>(&storage))
-        {
-            for (size_t i = 0; i != range->num_columns; ++i)
-            {
-                if (!invokeCallback(callback, range->columns[i]))
-                    return false;
-            }
-            return true;
-        }
-
-        if (const auto * range = std::get_if<SingleRawPtr>(&storage))
-            return invokeCallback(callback, range->column);
+        if (forEachStoredColumn(callback))
+            return;
 
         using CallbackType = std::remove_reference_t<Callback>;
-        return forEachImpl(
-            [](const IColumn * column, void * context)
-            { return ColumnsView::invokeCallback(*static_cast<CallbackType *>(context), column); },
+        forEachImpl(
+            [](const IColumn * column, void * context) { (*static_cast<CallbackType *>(context))(column); },
             const_cast<void *>(static_cast<const void *>(std::addressof(callback))));
     }
 
-    [[nodiscard]] std::optional<const IColumn *> tryGetSingle() const
+    /// The only column of the view, or `nullptr` if the view doesn't have exactly one column.
+    [[nodiscard]] const IColumn * tryGetSingle() const
     {
-        return std::visit(
-            Overloaded{
-                [](const ColumnPtrRange & range) -> std::optional<const IColumn *>
-                {
-                    if (range.num_columns != 1)
-                        return std::nullopt;
-                    return range.columns[0].get();
-                },
-                [](const RawPtrRange & range) -> std::optional<const IColumn *>
-                {
-                    if (range.num_columns != 1)
-                        return std::nullopt;
-                    return range.columns[0];
-                },
-                [](const SingleRawPtr & range) -> std::optional<const IColumn *> { return range.column; },
-                [](const ProjectedRange & range) -> std::optional<const IColumn *>
-                {
-                    std::optional<const IColumn *> base_column = range.base->tryGetSingle();
-                    if (!base_column)
-                        return std::nullopt;
-                    return range.mapper(*base_column, range.context);
-                },
-            },
-            storage);
-    }
+        if (const auto * projected = std::get_if<ProjectedRange>(&storage))
+        {
+            const IColumn * base_column = projected->base->tryGetSingle();
+            return base_column ? projected->mapper(base_column, projected->context) : nullptr;
+        }
 
-    [[nodiscard]] size_t size() const
-    {
-        return std::visit(
-            Overloaded{
-                [](const ColumnPtrRange & range) -> size_t { return range.num_columns; },
-                [](const RawPtrRange & range) -> size_t { return range.num_columns; },
-                [](const SingleRawPtr &) -> size_t { return 1; },
-                [](const ProjectedRange & range) -> size_t { return range.base->size(); },
-            },
-            storage);
+        if (const auto * single = std::get_if<SingleRawPtr>(&storage))
+            return single->column;
+
+        if (const auto * range = std::get_if<ColumnPtrRange>(&storage))
+            return range->num_columns == 1 ? range->columns[0].get() : nullptr;
+
+        const auto & range = std::get<RawPtrRange>(storage);
+        return range.num_columns == 1 ? range.columns[0] : nullptr;
     }
 
     [[nodiscard]] bool empty() const
     {
-        return std::visit(
-            Overloaded{
-                [](const ColumnPtrRange & range) -> bool { return range.num_columns == 0; },
-                [](const RawPtrRange & range) -> bool { return range.num_columns == 0; },
-                [](const SingleRawPtr &) -> bool { return false; },
-                [](const ProjectedRange & range) -> bool { return range.base->empty(); },
-            },
-            storage);
+        if (const auto * projected = std::get_if<ProjectedRange>(&storage))
+            return projected->base->empty();
+
+        if (std::holds_alternative<SingleRawPtr>(storage))
+            return false;
+
+        if (const auto * range = std::get_if<ColumnPtrRange>(&storage))
+            return range->num_columns == 0;
+
+        return std::get<RawPtrRange>(storage).num_columns == 0;
     }
 
 private:
@@ -202,68 +155,61 @@ private:
     {
     }
 
-    using ForEachCallback = bool (*)(const IColumn *, void *);
-
+    /// Calls `callback` for every column if the view stores its columns, and returns false if it is a projected view.
     template <typename Callback>
-    static bool invokeCallback(Callback & callback, const IColumn * column)
+    bool forEachStoredColumn(Callback & callback) const
     {
-        if constexpr (std::is_void_v<std::invoke_result_t<Callback &, const IColumn *>>)
+        if (const auto * range = std::get_if<ColumnPtrRange>(&storage))
         {
-            callback(column);
+            for (size_t i = 0; i != range->num_columns; ++i)
+                callback(range->columns[i].get());
             return true;
         }
-        else
+
+        if (const auto * range = std::get_if<RawPtrRange>(&storage))
         {
-            return callback(column);
+            for (size_t i = 0; i != range->num_columns; ++i)
+                callback(range->columns[i]);
+            return true;
         }
+
+        if (const auto * single = std::get_if<SingleRawPtr>(&storage))
+        {
+            callback(single->column);
+            return true;
+        }
+
+        return false;
     }
 
-    bool forEachImpl(ForEachCallback callback, void * callback_context) const
+    using ForEachCallback = void (*)(const IColumn *, void *);
+
+    /// Type-erased traversal, so that nested projections don't instantiate a template per nesting level.
+    void forEachImpl(ForEachCallback callback, void * callback_context) const
     {
-        struct ProjectedCallbackContext
+        if (const auto * projected = std::get_if<ProjectedRange>(&storage))
         {
-            Mapper mapper;
-            const void * mapper_context;
-            ForEachCallback callback;
-            void * callback_context;
-        };
+            struct ProjectedCallbackContext
+            {
+                Mapper mapper;
+                const void * mapper_context;
+                ForEachCallback callback;
+                void * callback_context;
+            };
 
-        return std::visit(
-            Overloaded{
-                [&](const ColumnPtrRange & range) -> bool
+            ProjectedCallbackContext context{projected->mapper, projected->context, callback, callback_context};
+            projected->base->forEachImpl(
+                [](const IColumn * column, void * opaque_context)
                 {
-                    for (size_t i = 0; i != range.num_columns; ++i)
-                    {
-                        if (!callback(range.columns[i].get(), callback_context))
-                            return false;
-                    }
-                    return true;
+                    const auto & typed_context = *static_cast<const ProjectedCallbackContext *>(opaque_context);
+                    typed_context.callback(typed_context.mapper(column, typed_context.mapper_context), typed_context.callback_context);
                 },
-                [&](const RawPtrRange & range) -> bool
-                {
-                    for (size_t i = 0; i != range.num_columns; ++i)
-                    {
-                        if (!callback(range.columns[i], callback_context))
-                            return false;
-                    }
-                    return true;
-                },
-                [&](const SingleRawPtr & range) -> bool { return callback(range.column, callback_context); },
-                [&](const ProjectedRange & range) -> bool
-                {
-                    ProjectedCallbackContext context{range.mapper, range.context, callback, callback_context};
+                &context);
+            return;
+        }
 
-                    return range.base->forEachImpl(
-                        [](const IColumn * column, void * opaque_context)
-                        {
-                            const auto & typed_context = *static_cast<const ProjectedCallbackContext *>(opaque_context);
-                            return typed_context.callback(
-                                typed_context.mapper(column, typed_context.mapper_context), typed_context.callback_context);
-                        },
-                        &context);
-                },
-            },
-            storage);
+        auto invoke = [&](const IColumn * column) { callback(column, callback_context); };
+        forEachStoredColumn(invoke);
     }
 
     Storage storage;

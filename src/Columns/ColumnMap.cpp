@@ -518,9 +518,6 @@ void ColumnMap::takeOrCalculateStatisticsFrom(const ColumnsView & source_columns
     source_columns.forEach(
         [&](const IColumn * source_column)
         {
-            if (!source_column)
-                throw Exception(ErrorCodes::LOGICAL_ERROR, "Source column is invalid");
-
             const auto * source_map = typeid_cast<const ColumnMap *>(source_column);
             if (!source_map)
                 throw Exception(ErrorCodes::LOGICAL_ERROR, "Source column is not Map, but {}", source_column->getName());
