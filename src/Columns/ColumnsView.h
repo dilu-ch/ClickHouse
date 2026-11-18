@@ -15,7 +15,11 @@ namespace DB
 /// Non-owning borrowed view over source columns.
 /// The referenced storage must outlive the call that receives this view.
 /// Do not store `ColumnsView` or pointers obtained from it.
-/// The view is expected to yield non-null `IColumn` pointers.
+///
+/// The view must yield non-null `IColumn` pointers. The types don't guarantee it (`ColumnPtr` is nullable), the callers
+/// do. They pass the columns of chunks and blocks, which are dereferenced on the way anyway (`Chunk` dereferences every
+/// column it is given), or nested columns, which every column creates on construction and never resets. Mappers must
+/// return such nested columns. `forEach` checks it in debug builds.
 class ColumnsView
 {
 public:
@@ -59,6 +63,7 @@ public:
     ColumnsView(const IColumn * column_) // NOLINT(google-explicit-constructor)
         : storage(SingleRawPtr{column_})
     {
+        chassert(column_, "ColumnsView over a null column");
     }
 
     ColumnsView(const ColumnsView &) = default;
@@ -162,14 +167,20 @@ private:
         if (const auto * range = std::get_if<ColumnPtrRange>(&storage))
         {
             for (size_t i = 0; i != range->num_columns; ++i)
+            {
+                chassert(range->columns[i], "ColumnsView over a null column");
                 callback(range->columns[i].get());
+            }
             return true;
         }
 
         if (const auto * range = std::get_if<RawPtrRange>(&storage))
         {
             for (size_t i = 0; i != range->num_columns; ++i)
+            {
+                chassert(range->columns[i], "ColumnsView over a null column");
                 callback(range->columns[i]);
+            }
             return true;
         }
 
@@ -202,7 +213,9 @@ private:
                 [](const IColumn * column, void * opaque_context)
                 {
                     const auto & typed_context = *static_cast<const ProjectedCallbackContext *>(opaque_context);
-                    typed_context.callback(typed_context.mapper(column, typed_context.mapper_context), typed_context.callback_context);
+                    const IColumn * mapped_column = typed_context.mapper(column, typed_context.mapper_context);
+                    chassert(mapped_column, "ColumnsView mapper returned a null column");
+                    typed_context.callback(mapped_column, typed_context.callback_context);
                 },
                 &context);
             return;

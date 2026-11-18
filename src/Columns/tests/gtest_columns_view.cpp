@@ -119,5 +119,35 @@ TEST(ColumnsView, GroupColumns)
     EXPECT_EQ(no_groups.size(), 0u);
     EXPECT_EQ(visited, 0u);
 }
+
+/// The non-null contract of the view is a `chassert`, which aborts only in debug and sanitizer builds: hence a death test.
+#ifdef DEBUG_OR_SANITIZER_BUILD
+
+const IColumn * mapToNull(const IColumn *, const void *)
+{
+    return nullptr;
+}
+
+TEST(ColumnsViewDeathTest, NullColumnsAreRejected)
+{
+    ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+
+    auto column = ColumnUInt64::create();
+
+    ColumnRawPtrs null_raw_ptrs{column.get(), nullptr};
+    EXPECT_DEATH(collect(ColumnsView(null_raw_ptrs)), "");
+
+    Columns null_column_ptrs(1);
+    EXPECT_DEATH(collect(ColumnsView(null_column_ptrs)), "");
+
+    const IColumn * null_column = nullptr;
+    EXPECT_DEATH({ ColumnsView view(null_column); }, "");
+
+    ColumnRawPtrs raw_ptrs{column.get()};
+    ColumnsView source_columns(raw_ptrs);
+    EXPECT_DEATH(collect(source_columns.project(mapToNull)), "");
+}
+
+#endif
 }
 }
