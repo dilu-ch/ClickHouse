@@ -20,16 +20,6 @@ namespace ErrorCodes
     extern const int LOGICAL_ERROR;
 }
 
-namespace
-{
-
-const IColumn * getMapNestedSourceColumn(const IColumn * source_column, const void *)
-{
-    return assert_cast<const ColumnMap &>(*source_column).getNestedColumnPtr().get();
-}
-
-}
-
 ColumnMap::Ptr ColumnMap::create(const ColumnPtr & keys, const ColumnPtr & values, const ColumnPtr & offsets, const StatisticsPtr & statistics_)
 {
     auto nested_column = ColumnArray::create(ColumnTuple::create(Columns{keys, values}), offsets);
@@ -317,16 +307,19 @@ size_t ColumnMap::capacity() const
 
 void ColumnMap::prepareForSquashing(const ColumnsView & source_columns, size_t factor)
 {
-    /// `getMapNestedSourceColumn` below relies on this check.
+    ColumnRawPtrsWithStackMemory nested_source_columns;
     source_columns.forEach(
         [&](const IColumn * source_column)
         {
-            if (!typeid_cast<const ColumnMap *>(source_column))
+            const auto * source_map = typeid_cast<const ColumnMap *>(source_column);
+            if (!source_map)
                 throw Exception(
                     ErrorCodes::LOGICAL_ERROR, "Source column for squashing of {} is not Map, but {}", getName(), source_column->getName());
+
+            nested_source_columns.push_back(&source_map->getNestedColumn());
         });
 
-    nested->prepareForSquashing(source_columns.project(getMapNestedSourceColumn), factor);
+    nested->prepareForSquashing(nested_source_columns, factor);
 }
 
 void ColumnMap::shrinkToFit()
@@ -473,16 +466,19 @@ void ColumnMap::Statistics::merge(const Statistics & other)
 
 void ColumnMap::chooseDynamicStructureForMerge(const ColumnsView & source_columns, std::optional<size_t> max_dynamic_subcolumns)
 {
-    /// `getMapNestedSourceColumn` below relies on this check.
+    ColumnRawPtrsWithStackMemory nested_source_columns;
     source_columns.forEach(
         [&](const IColumn * source_column)
         {
-            if (!typeid_cast<const ColumnMap *>(source_column))
+            const auto * source_map = typeid_cast<const ColumnMap *>(source_column);
+            if (!source_map)
                 throw Exception(
                     ErrorCodes::LOGICAL_ERROR, "Source column for merge of {} is not Map, but {}", getName(), source_column->getName());
+
+            nested_source_columns.push_back(&source_map->getNestedColumn());
         });
 
-    nested->chooseDynamicStructureForMerge(source_columns.project(getMapNestedSourceColumn), max_dynamic_subcolumns);
+    nested->chooseDynamicStructureForMerge(nested_source_columns, max_dynamic_subcolumns);
 }
 
 void ColumnMap::takeExactDynamicStructureFrom(const IColumn & source)
@@ -515,6 +511,7 @@ void ColumnMap::takeOrCalculateStatisticsFrom(const ColumnsView & source_columns
     if (!nested)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Nested column is not initialized");
 
+    ColumnRawPtrsWithStackMemory nested_source_columns;
     source_columns.forEach(
         [&](const IColumn * source_column)
         {
@@ -527,10 +524,11 @@ void ColumnMap::takeOrCalculateStatisticsFrom(const ColumnsView & source_columns
                 throw Exception(ErrorCodes::LOGICAL_ERROR, "Source statistics is invalid");
 
             new_statistics->merge(*source_statistics);
+            nested_source_columns.push_back(&source_map->getNestedColumn());
         });
 
     statistics = std::move(new_statistics);
-    nested->takeOrCalculateStatisticsFrom(source_columns.project(getMapNestedSourceColumn));
+    nested->takeOrCalculateStatisticsFrom(nested_source_columns);
 }
 
 

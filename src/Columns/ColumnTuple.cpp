@@ -31,12 +31,6 @@ namespace ErrorCodes
 namespace
 {
 
-/// The callers check the source columns with `checkSourceTupleColumns` before projecting them with this mapper.
-const IColumn * getTupleElementSourceColumn(const IColumn * source_column, const void * context)
-{
-    return assert_cast<const ColumnTuple &>(*source_column).getColumnPtr(*static_cast<const size_t *>(context)).get();
-}
-
 /// Source columns are addressed by the element index of the column, so they must have the same number of elements.
 void checkSourceTupleColumns(const ColumnsView & source_columns, const ColumnTuple & column, std::string_view operation)
 {
@@ -52,6 +46,15 @@ void checkSourceTupleColumns(const ColumnsView & source_columns, const ColumnTup
                     column.getName(),
                     source_column->getName());
         });
+}
+
+/// Collects element `i` of every source column into `element_source_columns`. The callers check the source columns with
+/// `checkSourceTupleColumns` first. One buffer serves all elements, so a wide tuple doesn't need a buffer per element.
+void collectElementSourceColumns(const ColumnsView & source_columns, size_t i, ColumnRawPtrsWithStackMemory & element_source_columns)
+{
+    element_source_columns.clear();
+    source_columns.forEach([&](const IColumn * source_column)
+                           { element_source_columns.push_back(&assert_cast<const ColumnTuple &>(*source_column).getColumn(i)); });
 }
 }
 
@@ -834,8 +837,12 @@ void ColumnTuple::prepareForSquashing(const ColumnsView & source_columns, size_t
     const size_t tuple_size = columns.size();
     checkSourceTupleColumns(source_columns, *this, "squashing");
 
+    ColumnRawPtrsWithStackMemory element_source_columns;
     for (size_t i = 0; i < tuple_size; ++i)
-        getColumn(i).prepareForSquashing(source_columns.project(getTupleElementSourceColumn, &i), factor);
+    {
+        collectElementSourceColumns(source_columns, i, element_source_columns);
+        getColumn(i).prepareForSquashing(element_source_columns, factor);
+    }
 }
 
 void ColumnTuple::shrinkToFit()
@@ -989,10 +996,14 @@ void ColumnTuple::chooseDynamicStructureForMerge(const ColumnsView & source_colu
     checkSourceTupleColumns(source_columns, *this, "merge");
 
     /// For the elements without dynamic structure it does nothing.
+    ColumnRawPtrsWithStackMemory element_source_columns;
     for (size_t i = 0; i != columns.size(); ++i)
     {
-        if (columns[i]->hasDynamicStructure())
-            columns[i]->chooseDynamicStructureForMerge(source_columns.project(getTupleElementSourceColumn, &i), max_dynamic_subcolumns);
+        if (!columns[i]->hasDynamicStructure())
+            continue;
+
+        collectElementSourceColumns(source_columns, i, element_source_columns);
+        columns[i]->chooseDynamicStructureForMerge(element_source_columns, max_dynamic_subcolumns);
     }
 }
 
@@ -1022,13 +1033,17 @@ void ColumnTuple::takeOrCalculateStatisticsFrom(const ColumnsView & source_colum
     checkSourceTupleColumns(source_columns, *this, "statistics");
 
     /// For the elements without statistics it does nothing.
+    ColumnRawPtrsWithStackMemory element_source_columns;
     for (size_t i = 0; i != columns.size(); ++i)
     {
         if (!columns[i])
             throw Exception(ErrorCodes::LOGICAL_ERROR, "Column {} of tuple is invalid", i);
 
-        if (columns[i]->hasStatistics())
-            columns[i]->takeOrCalculateStatisticsFrom(source_columns.project(getTupleElementSourceColumn, &i));
+        if (!columns[i]->hasStatistics())
+            continue;
+
+        collectElementSourceColumns(source_columns, i, element_source_columns);
+        columns[i]->takeOrCalculateStatisticsFrom(element_source_columns);
     }
 }
 

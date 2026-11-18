@@ -818,18 +818,26 @@ bool ColumnReplicated::structureEquals(const IColumn & rhs) const
 namespace
 {
 
-const IColumn * getReplicatedNestedOrSelfSourceColumn(const IColumn * source_column, const void *)
+/// The source columns of a merge into a replicated column may be replicated or not.
+void collectNestedOrSelfSourceColumns(const ColumnsView & source_columns, ColumnRawPtrsWithStackMemory & nested_source_columns)
 {
-    if (const auto * rhs_replicated = typeid_cast<const ColumnReplicated *>(source_column))
-        return rhs_replicated->getNestedColumn().get();
-    return source_column;
+    source_columns.forEach(
+        [&](const IColumn * source_column)
+        {
+            if (const auto * source_replicated = typeid_cast<const ColumnReplicated *>(source_column))
+                nested_source_columns.push_back(source_replicated->getNestedColumn().get());
+            else
+                nested_source_columns.push_back(source_column);
+        });
 }
 
 }
 
 void ColumnReplicated::chooseDynamicStructureForMerge(const ColumnsView & source_columns, std::optional<size_t> max_dynamic_subcolumns)
 {
-    nested_column->chooseDynamicStructureForMerge(source_columns.project(getReplicatedNestedOrSelfSourceColumn), max_dynamic_subcolumns);
+    ColumnRawPtrsWithStackMemory nested_source_columns;
+    collectNestedOrSelfSourceColumns(source_columns, nested_source_columns);
+    nested_column->chooseDynamicStructureForMerge(nested_source_columns, max_dynamic_subcolumns);
 }
 
 void ColumnReplicated::takeExactDynamicStructureFrom(const IColumn & source)
@@ -843,7 +851,9 @@ void ColumnReplicated::takeExactDynamicStructureFrom(const IColumn & source)
 
 void ColumnReplicated::takeOrCalculateStatisticsFrom(const ColumnsView & source_columns)
 {
-    nested_column->takeOrCalculateStatisticsFrom(source_columns.project(getReplicatedNestedOrSelfSourceColumn));
+    ColumnRawPtrsWithStackMemory nested_source_columns;
+    collectNestedOrSelfSourceColumns(source_columns, nested_source_columns);
+    nested_column->takeOrCalculateStatisticsFrom(nested_source_columns);
 }
 
 namespace

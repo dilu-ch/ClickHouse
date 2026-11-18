@@ -35,16 +35,6 @@ namespace ErrorCodes
     extern const int TOO_LARGE_ARRAY_SIZE;
 }
 
-namespace
-{
-
-const IColumn * getArrayNestedSourceColumn(const IColumn * source_column, const void *)
-{
-    return assert_cast<const ColumnArray &>(*source_column).getDataPtr().get();
-}
-
-}
-
 /** Obtaining array as Field can be slow for large arrays and consume vast amount of memory.
   * Just don't allow to do it.
   * You can increase the limit if the following query:
@@ -644,7 +634,7 @@ size_t ColumnArray::capacity() const
 void ColumnArray::prepareForSquashing(const ColumnsView & source_columns, size_t factor)
 {
     size_t new_size = size();
-    /// `getArrayNestedSourceColumn` below relies on this check.
+    ColumnRawPtrsWithStackMemory source_data_columns;
     source_columns.forEach(
         [&](const IColumn * source_column)
         {
@@ -657,10 +647,11 @@ void ColumnArray::prepareForSquashing(const ColumnsView & source_columns, size_t
                     source_column->getName());
 
             new_size += source_array_column->size();
+            source_data_columns.push_back(&source_array_column->getData());
         });
 
     getOffsets().reserve_exact(new_size * factor);
-    data->prepareForSquashing(source_columns.project(getArrayNestedSourceColumn), factor);
+    data->prepareForSquashing(source_data_columns, factor);
 }
 
 void ColumnArray::shrinkToFit()
@@ -1751,16 +1742,19 @@ size_t ColumnArray::getNumberOfDimensions() const
 
 void ColumnArray::chooseDynamicStructureForMerge(const ColumnsView & source_columns, std::optional<size_t> max_dynamic_subcolumns)
 {
-    /// `getArrayNestedSourceColumn` below relies on this check.
+    ColumnRawPtrsWithStackMemory source_data_columns;
     source_columns.forEach(
         [&](const IColumn * source_column)
         {
-            if (!typeid_cast<const ColumnArray *>(source_column))
+            const auto * source_array_column = typeid_cast<const ColumnArray *>(source_column);
+            if (!source_array_column)
                 throw Exception(
                     ErrorCodes::LOGICAL_ERROR, "Source column for merge of {} is not Array, but {}", getName(), source_column->getName());
+
+            source_data_columns.push_back(&source_array_column->getData());
         });
 
-    data->chooseDynamicStructureForMerge(source_columns.project(getArrayNestedSourceColumn), max_dynamic_subcolumns);
+    data->chooseDynamicStructureForMerge(source_data_columns, max_dynamic_subcolumns);
 }
 
 void ColumnArray::takeExactDynamicStructureFrom(const IColumn & source)
@@ -1777,15 +1771,18 @@ void ColumnArray::takeOrCalculateStatisticsFrom(const ColumnsView & source_colum
     if (!data)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Data column is invalid");
 
-    /// `getArrayNestedSourceColumn` below relies on this check.
+    ColumnRawPtrsWithStackMemory source_data_columns;
     source_columns.forEach(
         [&](const IColumn * source_column)
         {
-            if (!typeid_cast<const ColumnArray *>(source_column))
+            const auto * source_array_column = typeid_cast<const ColumnArray *>(source_column);
+            if (!source_array_column)
                 throw Exception(ErrorCodes::LOGICAL_ERROR, "Source column is not Array, but {}", source_column->getName());
+
+            source_data_columns.push_back(&source_array_column->getData());
         });
 
-    data->takeOrCalculateStatisticsFrom(source_columns.project(getArrayNestedSourceColumn));
+    data->takeOrCalculateStatisticsFrom(source_data_columns);
 }
 
 ColumnPlanes ColumnArray::getPlanes() const

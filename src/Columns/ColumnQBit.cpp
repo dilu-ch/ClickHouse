@@ -162,29 +162,24 @@ void ColumnQBit::forEachSubcolumnRecursively(RecursiveColumnCallback callback) c
     tuple->forEachSubcolumnRecursively(callback);
 }
 
-namespace
-{
-
-const IColumn * getQBitTupleSourceColumn(const IColumn * source_column, const void *)
-{
-    return assert_cast<const ColumnQBit &>(*source_column).getTuple().get();
-}
-}
-
 void ColumnQBit::prepareForSquashing(const ColumnsView & source_columns, size_t factor)
 {
-    /// `getQBitTupleSourceColumn` below relies on this check.
+    ColumnRawPtrsWithStackMemory source_tuple_columns;
     source_columns.forEach(
         [&](const IColumn * source_column)
         {
-            if (!typeid_cast<const ColumnQBit *>(source_column))
+            const auto * source_qbit = typeid_cast<const ColumnQBit *>(source_column);
+            if (!source_qbit)
                 throw Exception(
                     ErrorCodes::LOGICAL_ERROR,
                     "Source column for squashing of {} is not QBit, but {}",
                     getName(),
                     source_column->getName());
+
+            source_tuple_columns.push_back(source_qbit->getTuple().get());
         });
 
-    tuple->prepareForSquashing(source_columns.project(getQBitTupleSourceColumn), factor);
+    tuple->prepareForSquashing(source_tuple_columns, factor);
 }
+
 }

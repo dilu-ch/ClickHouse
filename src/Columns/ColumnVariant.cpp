@@ -32,18 +32,6 @@ namespace ErrorCodes
     extern const int INCORRECT_DATA;
 }
 
-namespace
-{
-
-const IColumn * getVariantSourceColumnByGlobalDiscriminator(const IColumn * source_column, const void * context)
-{
-    return assert_cast<const ColumnVariant &>(*source_column)
-        .getVariantPtrByGlobalDiscriminator(*static_cast<const size_t *>(context))
-        .get();
-}
-
-}
-
 static void checkDiscriminatorValue(ColumnVariant::Discriminator discr, size_t num_variants, bool allow_logical_error)
 {
     if (discr != ColumnVariant::NULL_DISCRIMINATOR && discr >= num_variants)
@@ -1540,20 +1528,31 @@ const ColumnVariant & getSourceVariantColumn(const IColumn & source, const Colum
     return *source_variant;
 }
 
+/// Collects the variant with global discriminator `i` of every source column into `variant_source_columns`. The callers check
+/// the source columns with `getSourceVariantColumn` first. One buffer serves all variants.
+void collectVariantSourceColumns(const ColumnsView & source_columns, size_t i, ColumnRawPtrsWithStackMemory & variant_source_columns)
+{
+    variant_source_columns.clear();
+    source_columns.forEach(
+        [&](const IColumn * source_column)
+        { variant_source_columns.push_back(&assert_cast<const ColumnVariant &>(*source_column).getVariantByGlobalDiscriminator(i)); });
+}
+
 }
 
 void ColumnVariant::prepareForSquashing(const ColumnsView & source_columns, size_t factor)
 {
     size_t new_size = size();
-    /// `getVariantSourceColumnByGlobalDiscriminator` below relies on this check.
+    /// `collectVariantSourceColumns` below relies on this check.
     source_columns.forEach([&](const IColumn * source_column)
                            { new_size += getSourceVariantColumn(*source_column, *this, "squashing").size(); });
     reserve(new_size * factor);
 
+    ColumnRawPtrsWithStackMemory variant_source_columns;
     for (size_t i = 0; i != variants.size(); ++i)
     {
-        getVariantByGlobalDiscriminator(i).prepareForSquashing(
-            source_columns.project(getVariantSourceColumnByGlobalDiscriminator, &i), factor);
+        collectVariantSourceColumns(source_columns, i, variant_source_columns);
+        getVariantByGlobalDiscriminator(i).prepareForSquashing(variant_source_columns, factor);
     }
 }
 
@@ -1962,17 +1961,20 @@ bool ColumnVariant::hasDynamicStructure() const
 
 void ColumnVariant::chooseDynamicStructureForMerge(const ColumnsView & source_columns, std::optional<size_t> max_dynamic_subcolumns)
 {
-    /// `getVariantSourceColumnByGlobalDiscriminator` below relies on this check.
+    /// `collectVariantSourceColumns` below relies on this check.
     source_columns.forEach([&](const IColumn * source_column) { getSourceVariantColumn(*source_column, *this, "merge"); });
 
     /// For the variants without dynamic structure it does nothing.
+    ColumnRawPtrsWithStackMemory variant_source_columns;
     size_t num_variants = variants.size();
     for (size_t i = 0; i != num_variants; ++i)
     {
         auto & variant = getVariantByGlobalDiscriminator(i);
-        if (variant.hasDynamicStructure())
-            variant.chooseDynamicStructureForMerge(
-                source_columns.project(getVariantSourceColumnByGlobalDiscriminator, &i), max_dynamic_subcolumns);
+        if (!variant.hasDynamicStructure())
+            continue;
+
+        collectVariantSourceColumns(source_columns, i, variant_source_columns);
+        variant.chooseDynamicStructureForMerge(variant_source_columns, max_dynamic_subcolumns);
     }
 }
 
@@ -2035,17 +2037,21 @@ bool ColumnVariant::hasStatistics() const
 
 void ColumnVariant::takeOrCalculateStatisticsFrom(const ColumnsView & source_columns)
 {
-    /// `getVariantSourceColumnByGlobalDiscriminator` below relies on this check.
+    /// `collectVariantSourceColumns` below relies on this check.
     source_columns.forEach([&](const IColumn * source_column) { getSourceVariantColumn(*source_column, *this, "statistics"); });
 
     /// Iterate by global discriminator: source columns are addressed by global discriminator,
     /// so the destination variant must be too (local order may differ from global order).
     /// For the variants without statistics it does nothing.
+    ColumnRawPtrsWithStackMemory variant_source_columns;
     for (size_t i = 0; i != variants.size(); ++i)
     {
         auto & variant = getVariantByGlobalDiscriminator(i);
-        if (variant.hasStatistics())
-            variant.takeOrCalculateStatisticsFrom(source_columns.project(getVariantSourceColumnByGlobalDiscriminator, &i));
+        if (!variant.hasStatistics())
+            continue;
+
+        collectVariantSourceColumns(source_columns, i, variant_source_columns);
+        variant.takeOrCalculateStatisticsFrom(variant_source_columns);
     }
 }
 

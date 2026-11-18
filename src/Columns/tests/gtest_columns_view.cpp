@@ -7,17 +7,6 @@ namespace DB
 namespace
 {
 
-const IColumn * identity(const IColumn * column, const void *)
-{
-    return column;
-}
-
-/// Maps every source column to the column in `context`.
-const IColumn * mapToContext(const IColumn *, const void * context)
-{
-    return static_cast<const IColumn *>(context);
-}
-
 ColumnRawPtrs collect(const ColumnsView & columns)
 {
     ColumnRawPtrs result;
@@ -25,46 +14,46 @@ ColumnRawPtrs collect(const ColumnsView & columns)
     return result;
 }
 
-TEST(ColumnsView, ProjectedViewIntrospection)
+TEST(ColumnsView, StorageKinds)
 {
-    auto first_column = ColumnUInt64::create();
-    auto second_column = ColumnUInt64::create();
-    auto mapped_column = ColumnUInt64::create();
-    const IColumn * first_column_ptr = first_column.get();
-    const IColumn * mapped_column_ptr = mapped_column.get();
-
     Columns columns;
-    columns.emplace_back(std::move(first_column));
-    columns.emplace_back(std::move(second_column));
-    ColumnsView source_columns(columns);
+    ColumnRawPtrs column_ptrs;
+    for (size_t i = 0; i != 20; ++i)
+    {
+        auto column = ColumnUInt64::create();
+        column_ptrs.push_back(column.get());
+        columns.emplace_back(std::move(column));
+    }
 
-    auto projected = source_columns.project(mapToContext, mapped_column_ptr);
-    EXPECT_FALSE(projected.empty());
-    EXPECT_EQ(projected.tryGetSingle(), nullptr);
-    EXPECT_EQ(collect(projected), (ColumnRawPtrs{mapped_column_ptr, mapped_column_ptr}));
+    auto expect_columns = [](const ColumnsView & view, const ColumnRawPtrs & expected)
+    {
+        EXPECT_EQ(collect(view), expected);
+        EXPECT_EQ(view.empty(), expected.empty());
+        EXPECT_EQ(view.tryGetSingle(), expected.size() == 1 ? expected.front() : nullptr);
+    };
 
-    /// A projection of a projection of a single column.
-    ColumnsView single_column(columns.front());
-    auto projected_single = single_column.project(identity);
-    auto projected_twice = projected_single.project(mapToContext, mapped_column_ptr);
-    EXPECT_FALSE(projected_twice.empty());
-    EXPECT_EQ(projected_single.tryGetSingle(), first_column_ptr);
-    EXPECT_EQ(projected_twice.tryGetSingle(), mapped_column_ptr);
-    EXPECT_EQ(collect(projected_twice), (ColumnRawPtrs{mapped_column_ptr}));
+    /// Smart pointers.
+    expect_columns(columns, column_ptrs);
+    VectorWithMemoryTracking<ColumnPtr> tracked_columns(columns.begin(), columns.begin() + 2);
+    expect_columns(tracked_columns, {column_ptrs[0], column_ptrs[1]});
+    expect_columns(columns.front(), {column_ptrs[0]});
+    const Columns no_columns;
+    expect_columns(no_columns, {});
 
-    /// A projection of no columns.
-    ColumnRawPtrs no_column_ptrs;
-    ColumnsView no_columns(no_column_ptrs);
-    auto projected_empty = no_columns.project(identity);
-    EXPECT_TRUE(projected_empty.empty());
-    EXPECT_EQ(projected_empty.tryGetSingle(), nullptr);
-    EXPECT_TRUE(collect(projected_empty).empty());
+    /// Raw pointers.
+    expect_columns(column_ptrs, column_ptrs);
+    expect_columns(ColumnsView(std::span<const IColumn * const>(column_ptrs.data() + 3, 2)), {column_ptrs[3], column_ptrs[4]});
+    expect_columns(column_ptrs[5], {column_ptrs[5]});
+    expect_columns(ColumnsView(std::span<const IColumn * const>()), {});
 
-    /// A single raw pointer.
-    ColumnsView single_raw_ptr(first_column_ptr);
-    EXPECT_FALSE(single_raw_ptr.empty());
-    EXPECT_EQ(single_raw_ptr.tryGetSingle(), first_column_ptr);
-    EXPECT_EQ(collect(single_raw_ptr.project(mapToContext, mapped_column_ptr)), (ColumnRawPtrs{mapped_column_ptr}));
+    /// Raw pointers with stack memory, inline and after growing out of the stack memory.
+    ColumnRawPtrsWithStackMemory stack_column_ptrs;
+    expect_columns(stack_column_ptrs, {});
+    for (size_t i = 0; i != column_ptrs.size(); ++i)
+    {
+        stack_column_ptrs.push_back(column_ptrs[i]);
+        expect_columns(stack_column_ptrs, ColumnRawPtrs(column_ptrs.begin(), column_ptrs.begin() + i + 1));
+    }
 }
 
 TEST(ColumnsView, GroupColumns)
@@ -100,9 +89,9 @@ TEST(ColumnsView, GroupColumns)
     EXPECT_TRUE(groups[3].empty());
     EXPECT_EQ(groups[3].tryGetSingle(), nullptr);
 
-    /// The source columns can be any view, for example a projected one, and a source column may have no children.
+    /// The source columns can be any view, and a source column may have no children.
     auto non_empty_groups = groupColumns(
-        source_columns.project(identity),
+        ColumnsView(column_ptrs),
         2,
         [](const IColumn * column, auto && emit)
         {
@@ -123,11 +112,6 @@ TEST(ColumnsView, GroupColumns)
 /// The non-null contract of the view is a `chassert`, which aborts only in debug and sanitizer builds: hence a death test.
 #ifdef DEBUG_OR_SANITIZER_BUILD
 
-const IColumn * mapToNull(const IColumn *, const void *)
-{
-    return nullptr;
-}
-
 TEST(ColumnsViewDeathTest, NullColumnsAreRejected)
 {
     ::testing::FLAGS_gtest_death_test_style = "threadsafe";
@@ -143,9 +127,9 @@ TEST(ColumnsViewDeathTest, NullColumnsAreRejected)
     const IColumn * null_column = nullptr;
     EXPECT_DEATH({ ColumnsView view(null_column); }, "");
 
-    ColumnRawPtrs raw_ptrs{column.get()};
-    ColumnsView source_columns(raw_ptrs);
-    EXPECT_DEATH(collect(source_columns.project(mapToNull)), "");
+    ColumnRawPtrsWithStackMemory null_stack_ptrs;
+    null_stack_ptrs.push_back(nullptr);
+    EXPECT_DEATH(collect(ColumnsView(null_stack_ptrs)), "");
 }
 
 #endif

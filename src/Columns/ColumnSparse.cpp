@@ -1085,18 +1085,14 @@ const ColumnSparse & getSourceSparseColumn(const IColumn & source, const ColumnS
     return *source_sparse;
 }
 
-/// The callers check the source columns with `getSourceSparseColumn` before projecting them with this mapper.
-const IColumn * getSparseValuesSourceColumn(const IColumn * source_column, const void *)
-{
-    return assert_cast<const ColumnSparse &>(*source_column).getValuesPtr().get();
-}
-
 }
 
 void ColumnSparse::chooseDynamicStructureForMerge(const ColumnsView & source_columns, std::optional<size_t> max_dynamic_subcolumns)
 {
-    source_columns.forEach([&](const IColumn * source_column) { getSourceSparseColumn(*source_column, *this, "merge"); });
-    values->chooseDynamicStructureForMerge(source_columns.project(getSparseValuesSourceColumn), max_dynamic_subcolumns);
+    ColumnRawPtrsWithStackMemory values_source_columns;
+    source_columns.forEach([&](const IColumn * source_column)
+                           { values_source_columns.push_back(&getSourceSparseColumn(*source_column, *this, "merge").getValuesColumn()); });
+    values->chooseDynamicStructureForMerge(values_source_columns, max_dynamic_subcolumns);
 }
 
 void ColumnSparse::takeExactDynamicStructureFrom(const IColumn & source)
@@ -1106,8 +1102,11 @@ void ColumnSparse::takeExactDynamicStructureFrom(const IColumn & source)
 
 void ColumnSparse::takeOrCalculateStatisticsFrom(const ColumnsView & source_columns)
 {
-    source_columns.forEach([&](const IColumn * source_column) { getSourceSparseColumn(*source_column, *this, "statistics"); });
-    values->takeOrCalculateStatisticsFrom(source_columns.project(getSparseValuesSourceColumn));
+    ColumnRawPtrsWithStackMemory values_source_columns;
+    source_columns.forEach(
+        [&](const IColumn * source_column)
+        { values_source_columns.push_back(&getSourceSparseColumn(*source_column, *this, "statistics").getValuesColumn()); });
+    values->takeOrCalculateStatisticsFrom(values_source_columns);
 }
 
 ColumnPtr recursiveRemoveSparse(const ColumnPtr & column)

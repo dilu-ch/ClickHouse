@@ -35,15 +35,6 @@ namespace ErrorCodes
     extern const int BAD_ARGUMENTS;
 }
 
-namespace
-{
-
-const IColumn * getNullableNestedSourceColumn(const IColumn * source_column, const void *)
-{
-    return assert_cast<const ColumnNullable &>(*source_column).getNestedColumnPtr().get();
-}
-
-}
 
 ColumnNullable::ColumnNullable(MutableColumnPtr && nested_column_, MutableColumnPtr && null_map_)
     : nested_column(std::move(nested_column_)), null_map(std::move(null_map_))
@@ -833,7 +824,7 @@ size_t ColumnNullable::capacity() const
 void ColumnNullable::prepareForSquashing(const ColumnsView & source_columns, size_t factor)
 {
     size_t new_size = size();
-    /// `getNullableNestedSourceColumn` below relies on this check.
+    ColumnRawPtrsWithStackMemory nested_source_columns;
     source_columns.forEach(
         [&](const IColumn * source_column)
         {
@@ -846,9 +837,10 @@ void ColumnNullable::prepareForSquashing(const ColumnsView & source_columns, siz
                     source_column->getName());
 
             new_size += source_nullable_column->size();
+            nested_source_columns.push_back(&source_nullable_column->getNestedColumn());
         });
 
-    nested_column->prepareForSquashing(source_columns.project(getNullableNestedSourceColumn), factor);
+    nested_column->prepareForSquashing(nested_source_columns, factor);
     getNullMapData().reserve(new_size * factor);
 }
 
@@ -1078,19 +1070,22 @@ ColumnPtr ColumnNullable::getNestedColumnWithDefaultOnNull() const
 
 void ColumnNullable::chooseDynamicStructureForMerge(const ColumnsView & source_columns, std::optional<size_t> max_dynamic_subcolumns)
 {
-    /// `getNullableNestedSourceColumn` below relies on this check.
+    ColumnRawPtrsWithStackMemory nested_source_columns;
     source_columns.forEach(
         [&](const IColumn * source_column)
         {
-            if (!typeid_cast<const ColumnNullable *>(source_column))
+            const auto * source_nullable_column = typeid_cast<const ColumnNullable *>(source_column);
+            if (!source_nullable_column)
                 throw Exception(
                     ErrorCodes::LOGICAL_ERROR,
                     "Source column for merge of {} is not Nullable, but {}",
                     getName(),
                     source_column->getName());
+
+            nested_source_columns.push_back(&source_nullable_column->getNestedColumn());
         });
 
-    nested_column->chooseDynamicStructureForMerge(source_columns.project(getNullableNestedSourceColumn), max_dynamic_subcolumns);
+    nested_column->chooseDynamicStructureForMerge(nested_source_columns, max_dynamic_subcolumns);
 }
 
 void ColumnNullable::takeExactDynamicStructureFrom(const IColumn & source)
@@ -1110,19 +1105,22 @@ bool ColumnNullable::dynamicStructureEquals(const IColumn & rhs) const
 
 void ColumnNullable::takeOrCalculateStatisticsFrom(const ColumnsView & source_columns)
 {
-    /// `getNullableNestedSourceColumn` below relies on this check.
+    ColumnRawPtrsWithStackMemory nested_source_columns;
     source_columns.forEach(
         [&](const IColumn * source_column)
         {
-            if (!typeid_cast<const ColumnNullable *>(source_column))
+            const auto * source_nullable_column = typeid_cast<const ColumnNullable *>(source_column);
+            if (!source_nullable_column)
                 throw Exception(
                     ErrorCodes::LOGICAL_ERROR,
                     "Source column for statistics of {} is not Nullable, but {}",
                     getName(),
                     source_column->getName());
+
+            nested_source_columns.push_back(&source_nullable_column->getNestedColumn());
         });
 
-    nested_column->takeOrCalculateStatisticsFrom(source_columns.project(getNullableNestedSourceColumn));
+    nested_column->takeOrCalculateStatisticsFrom(nested_source_columns);
 }
 
 void ColumnNullable::gatherFromRows(const RowPointers & rows, size_t field_offset, size_t field_size, size_t begin, size_t count, PaddedPODArray<UInt8> *)

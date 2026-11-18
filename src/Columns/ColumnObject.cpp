@@ -67,11 +67,6 @@ const SerializationPtr & getDynamicSerialization()
     return dynamic_serialization;
 }
 
-const IColumn * getObjectSharedDataSourceColumn(const IColumn * source_column, const void *)
-{
-    return assert_cast<const ColumnObject &>(*source_column).getSharedDataPtr().get();
-}
-
 /// Which paths of the source Object columns `forEachPathWithSourceColumns` matches with the paths of the column.
 enum class ObjectPathKind : uint8_t
 {
@@ -98,8 +93,7 @@ const auto & getObjectPaths(const ColumnObject & column, ObjectPathKind kind)
 ///
 /// It walks the paths of every source column and looks them up in `paths`, instead of looking up every path in every source
 /// column: with sparse JSON a source column has only a few of the resulting dynamic paths, and most of those lookups would
-/// be misses. The source columns of every path are materialized, so that the recursive calls on the path columns, which
-/// traverse their sources several times and at every nesting level, don't repeat the lookups.
+/// be misses.
 template <typename Paths, typename Callback>
 void forEachPathWithSourceColumns(Paths & paths, ObjectPathKind kind, const ColumnsView & source_columns, Callback && callback)
 {
@@ -2061,9 +2055,16 @@ void ColumnObject::prepareForSquashing(const ColumnsView & source_columns, size_
     /// Include the rows that this column already has: the discriminators and offsets of the dynamic paths are reserved
     /// exactly, so a smaller reservation makes every dynamic path grow (reallocate and copy) during the squashing.
     size_t total_size = size();
-    source_columns.forEach([&](const IColumn * source_column) { total_size += source_column->size(); });
+    ColumnRawPtrsWithStackMemory shared_data_source_columns;
+    source_columns.forEach(
+        [&](const IColumn * source_column)
+        {
+            const auto & source_object = assert_cast<const ColumnObject &>(*source_column);
+            total_size += source_object.size();
+            shared_data_source_columns.push_back(source_object.shared_data.get());
+        });
 
-    shared_data->prepareForSquashing(source_columns.project(getObjectSharedDataSourceColumn), factor);
+    shared_data->prepareForSquashing(shared_data_source_columns, factor);
 
     forEachPathWithSourceColumns(
         typed_paths,
