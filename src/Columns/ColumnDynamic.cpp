@@ -67,16 +67,41 @@ const FormatSettings & getFormatSettings()
     return settings;
 }
 
-const IColumn * getDynamicVariantSourceColumnIfExists(const IColumn * source_column, const void * context)
+/// Groups the variants of the source Dynamic columns by the global discriminator of the same variant in `column`: group `i`
+/// has the columns of variant `i` of `column` in the source columns that have it, in the order of the source columns.
+/// Source variants that `column` doesn't have are skipped. The source columns must be Dynamic.
+///
+/// The groups are materialized on purpose. A lazy `filterProject` per variant would look up the variant in every source,
+/// but the recursive calls on a variant traverse their sources several times, and a nested view repeats the lookups of
+/// its base on every traversal. For example, the `Dynamic` inside an `Array(Dynamic)` variant, which `JSON` uses for
+/// arrays of values of different types, traverses its sources once per its own variant. Grouping walks the variants of
+/// every source once and looks them up in the map of `column`, which stays in the cache.
+GroupedColumns groupVariantSourceColumns(const ColumnDynamic & column, const ColumnsView & source_columns)
 {
-    const auto & variant_name = *static_cast<const String *>(context);
-    const auto & source_dynamic_column = assert_cast<const ColumnDynamic &>(*source_column);
-    const auto & source_variant_info = source_dynamic_column.getVariantInfo();
-    auto it = source_variant_info.variant_name_to_discriminator.find(variant_name);
-    if (it == source_variant_info.variant_name_to_discriminator.end())
-        return nullptr;
+    const auto & variant_info = column.getVariantInfo();
+    return groupColumns(
+        source_columns,
+        variant_info.variant_names.size(),
+        [&](const IColumn * source_column, auto && emit)
+        {
+            const auto & source_dynamic_column = assert_cast<const ColumnDynamic &>(*source_column);
+            const auto & source_variant_info = source_dynamic_column.getVariantInfo();
+            const auto & source_variant_column = source_dynamic_column.getVariantColumn();
+            /// The same variants have the same global discriminators, and usually the sources have the same variants.
+            if (source_variant_info.variant_name == variant_info.variant_name)
+            {
+                for (size_t i = 0; i != source_variant_info.variant_names.size(); ++i)
+                    emit(i, source_variant_column.getVariantPtrByGlobalDiscriminator(i).get());
+                return;
+            }
 
-    return source_dynamic_column.getVariantColumn().getVariantPtrByGlobalDiscriminator(it->second).get();
+            for (size_t i = 0; i != source_variant_info.variant_names.size(); ++i)
+            {
+                auto it = variant_info.variant_name_to_discriminator.find(source_variant_info.variant_names[i]);
+                if (it != variant_info.variant_name_to_discriminator.end())
+                    emit(it->second, source_variant_column.getVariantPtrByGlobalDiscriminator(i).get());
+            }
+        });
 }
 
 }
@@ -1512,7 +1537,7 @@ void ColumnDynamic::prepareVariantsForSquashing(const ColumnsView & source_colum
         }
     };
 
-    /// `getDynamicVariantSourceColumnIfExists` below relies on this check.
+    /// `groupVariantSourceColumns` below relies on this check.
     source_columns.forEach([&](const IColumn * source_column)
                            { add_variants(getSourceDynamicColumn(*source_column, *this, "squashing")); });
 
@@ -1566,13 +1591,10 @@ void ColumnDynamic::prepareVariantsForSquashing(const ColumnsView & source_colum
 
     /// Now current dynamic column has all resulting variants and we can call
     /// prepareForSquashing on them to preallocate the memory.
+    const auto variants_source_columns = groupVariantSourceColumns(*this, source_columns);
     auto & variant_col = getVariantColumn();
-    for (size_t i = 0; i != variant_info.variant_names.size(); ++i)
-    {
-        const auto & variant_name = variant_info.variant_names[i];
-        variant_col.getVariantByGlobalDiscriminator(i).prepareForSquashing(
-            source_columns.filterProject(getDynamicVariantSourceColumnIfExists, &variant_name), factor);
-    }
+    for (size_t i = 0; i != variants_source_columns.size(); ++i)
+        variant_col.getVariantByGlobalDiscriminator(i).prepareForSquashing(variants_source_columns[i], factor);
 }
 
 bool ColumnDynamic::dynamicStructureEquals(const IColumn & rhs) const
@@ -1699,13 +1721,18 @@ void ColumnDynamic::chooseDynamicStructureForMerge(const ColumnsView & source_co
     /// Now we have the resulting Variant that will be used in all merged columns.
     /// Variants can also contain Dynamic columns inside, we should collect
     /// all source variants that will be used in the resulting merged column
-    /// and call `chooseDynamicStructureForMerge` on all resulting variants.
+    /// and call `chooseDynamicStructureForMerge` on the resulting variants with dynamic structure.
+    /// For the other variants it does nothing, and usually no variant has dynamic structure, so don't collect the sources then.
     auto & variant_col = getVariantColumn();
-    for (size_t i = 0; i != variant_info.variant_names.size(); ++i)
+    if (!variant_col.hasDynamicStructure())
+        return;
+
+    const auto variants_source_columns = groupVariantSourceColumns(*this, source_columns);
+    for (size_t i = 0; i != variants_source_columns.size(); ++i)
     {
-        const auto & variant_name = variant_info.variant_names[i];
-        variant_col.getVariantByGlobalDiscriminator(i).chooseDynamicStructureForMerge(
-            source_columns.filterProject(getDynamicVariantSourceColumnIfExists, &variant_name), max_dynamic_subcolumns);
+        auto & variant = variant_col.getVariantByGlobalDiscriminator(i);
+        if (variant.hasDynamicStructure())
+            variant.chooseDynamicStructureForMerge(variants_source_columns[i], max_dynamic_subcolumns);
     }
 }
 
@@ -1823,8 +1850,12 @@ void ColumnDynamic::takeOrCalculateStatisticsFrom(const ColumnsView & source_col
 
     statistics = std::make_shared<const Statistics>(std::move(new_statistics));
 
-    /// Recursively update statistics for nested variants.
+    /// Recursively update statistics for nested variants with statistics (e.g. `Map` or `Array(JSON)`).
+    /// For the other variants it does nothing, and usually no variant has statistics, so don't look for the sources then.
     auto & variant_col = getVariantColumn();
+    if (!variant_col.hasStatistics())
+        return;
+
     if (std::optional<const IColumn *> single_source_column = source_columns.tryGetSingle(); single_source_column)
     {
         const IColumn * source_column = *single_source_column;
@@ -1832,22 +1863,26 @@ void ColumnDynamic::takeOrCalculateStatisticsFrom(const ColumnsView & source_col
         const auto & source_variant_info = source_dynamic_column.getVariantInfo();
         for (size_t i = 0; i != variant_info.variant_names.size(); ++i)
         {
+            auto & variant = variant_col.getVariantByGlobalDiscriminator(i);
+            if (!variant.hasStatistics())
+                continue;
+
             auto it = source_variant_info.variant_name_to_discriminator.find(variant_info.variant_names[i]);
             if (it == source_variant_info.variant_name_to_discriminator.end())
                 continue;
 
             const auto & source_variant_column = source_dynamic_column.getVariantColumn().getVariantPtrByGlobalDiscriminator(it->second);
-            variant_col.getVariantByGlobalDiscriminator(i).takeOrCalculateStatisticsFrom(source_variant_column);
+            variant.takeOrCalculateStatisticsFrom(source_variant_column);
         }
         return;
     }
 
-    for (size_t i = 0; i != variant_info.variant_names.size(); ++i)
+    const auto variants_source_columns = groupVariantSourceColumns(*this, source_columns);
+    for (size_t i = 0; i != variants_source_columns.size(); ++i)
     {
-        const auto & variant_name = variant_info.variant_names[i];
-        auto variant_source_columns = source_columns.filterProject(getDynamicVariantSourceColumnIfExists, &variant_name);
-        if (!variant_source_columns.empty())
-            variant_col.getVariantByGlobalDiscriminator(i).takeOrCalculateStatisticsFrom(variant_source_columns);
+        auto & variant = variant_col.getVariantByGlobalDiscriminator(i);
+        if (variant.hasStatistics() && !variants_source_columns[i].empty())
+            variant.takeOrCalculateStatisticsFrom(variants_source_columns[i]);
     }
 }
 
