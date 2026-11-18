@@ -3,6 +3,7 @@
 #include <base/types.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage_fwd.h>
 #include <Interpreters/Context_fwd.h>
+#include <Server/IcebergRESTCatalog/IcebergRESTCatalogCredentialVendor.h>
 #include <Server/IcebergRESTCatalog/IcebergRESTCatalogKeeperConfig.h>
 #include <Server/IcebergRESTCatalog/IcebergRESTCatalogWarehouseDefinition.h>
 #include <Server/IcebergRESTCatalog/KeeperIcebergRESTCatalogStore.h>
@@ -11,6 +12,8 @@
 
 namespace DB
 {
+
+using IcebergRESTCatalogCredentialVendorPtr = std::shared_ptr<const IcebergRESTCatalogCredentialVendor>;
 
 /// One warehouse of the Iceberg REST catalog (RFC: issue #114697).
 class IcebergRESTCatalogWarehouse
@@ -23,7 +26,11 @@ public:
     };
 
     IcebergRESTCatalogWarehouse(
-        String name_, String base_location_, KeeperIcebergRESTCatalogStorePtr store_, ObjectStoragePtr object_storage_);
+        String name_,
+        String base_location_,
+        KeeperIcebergRESTCatalogStorePtr store_,
+        ObjectStoragePtr object_storage_,
+        IcebergRESTCatalogCredentialVendorPtr credential_vendor_);
 
     /// Also the REST `prefix`.
     const String name;
@@ -57,6 +64,9 @@ public:
     using UpdateTablesResult = KeeperIcebergRESTCatalogStore::UpdateTablesResult;
     [[nodiscard]] UpdateTablesResult updateTables(const std::vector<TableUpdate> & updates) const;
 
+    /// Temporary S3 credentials for the table at `location`.
+    [[nodiscard]] IcebergRESTCatalogVendedCredentials vendCredentials(const String & location, IcebergRESTCatalogVendedAccess access) const;
+
     /// Checks that the role was assumed, then lists one key under `base_location`. This proves that the role can read the location.
     void checkStorageAccess() const;
 
@@ -64,6 +74,7 @@ private:
     void validateLocation(const S3Location & location) const;
 
     const KeeperIcebergRESTCatalogStorePtr store;
+    const IcebergRESTCatalogCredentialVendorPtr credential_vendor;
 };
 
 using IcebergRESTCatalogWarehousePtr = std::shared_ptr<const IcebergRESTCatalogWarehouse>;

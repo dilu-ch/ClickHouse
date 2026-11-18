@@ -61,6 +61,7 @@ namespace ErrorCodes
     extern const int KEEPER_EXCEPTION;
     extern const int NO_ZOOKEEPER;
     extern const int REQUIRED_PASSWORD;
+    extern const int S3_ERROR;
     extern const int SUPPORT_IS_DISABLED;
     extern const int LOGICAL_ERROR;
 }
@@ -401,6 +402,9 @@ void IcebergRESTCatalogHandler::handleRequest(HTTPServerRequest & request, HTTPS
                 break;
         }
 
+        /// The header is a comma-separated list of the mechanisms that the client supports.
+        const bool vend_credentials = request.get("X-Iceberg-Access-Delegation", "").contains("vended-credentials");
+
         const auto & prefix = match->path_params.at("prefix");
         const auto warehouse = warehouses->tryGet(prefix);
         if (!warehouse)
@@ -434,10 +438,10 @@ void IcebergRESTCatalogHandler::handleRequest(HTTPServerRequest & request, HTTPS
                 handleListTables(*warehouse, *match, response);
                 return;
             case IcebergRESTOperation::CreateTable:
-                handleCreateTable(*warehouse, *match, body, response, *context);
+                handleCreateTable(*warehouse, *match, body, vend_credentials, response, *context);
                 return;
             case IcebergRESTOperation::LoadTable:
-                handleLoadTable(*warehouse, *match, response);
+                handleLoadTable(*warehouse, *match, vend_credentials, response, *context);
                 return;
             case IcebergRESTOperation::TableExists:
                 handleTableExists(*warehouse, *match, response);
@@ -505,6 +509,12 @@ void IcebergRESTCatalogHandler::handleRequest(HTTPServerRequest & request, HTTPS
             status = Poco::Net::HTTPResponse::HTTP_SERVICE_UNAVAILABLE;
             type = "ServiceUnavailableException";
             message = "Catalog storage is unavailable";
+        }
+        /// STS or S3 refused a request. The server log has the details, which include the role of the warehouse.
+        else if (code == ErrorCodes::S3_ERROR)
+        {
+            type = "ServiceFailureException";
+            message = "Storage request failed. See the server log for the error";
         }
         /// The catalog is healthy, the client should retry the request.
         else if (code == ErrorCodes::ICEBERG_CATALOG_CONCURRENT_UPDATE)
@@ -790,15 +800,57 @@ Poco::JSON::Object::Ptr IcebergRESTCatalogHandler::readTableMetadata(
     return parseJSONObject(content, fmt::format("Metadata file {}", pointer.metadata_location));
 }
 
+std::optional<IcebergRESTCatalogVendedCredentials> IcebergRESTCatalogHandler::vendTableCredentials(
+    const IcebergRESTCatalogWarehouse & warehouse,
+    const IcebergNamespaceName & ns,
+    const String & table,
+    const String & location,
+    IcebergRESTCatalogVendedAccess access,
+    bool vend_credentials,
+    const Context & context) const
+{
+    if (!vend_credentials)
+        return std::nullopt;
+
+    auto credentials = warehouse.vendCredentials(location, access);
+    LOG_INFO(
+        log,
+        "Vended {} credentials for table {}.{} at {} to user {}, they expire at {} ms",
+        access == IcebergRESTCatalogVendedAccess::ReadOnly ? "read-only" : "read-write",
+        joinNamespace(ns),
+        table,
+        location,
+        context.getUserName(),
+        credentials.expires_at_ms);
+    return credentials;
+}
+
 void IcebergRESTCatalogHandler::sendLoadTableResult(
-    const std::optional<String> & metadata_location, const Poco::JSON::Object::Ptr & metadata, HTTPServerResponse & response)
+    const std::optional<String> & metadata_location,
+    const Poco::JSON::Object::Ptr & metadata,
+    const std::optional<IcebergRESTCatalogVendedCredentials> & credentials,
+    HTTPServerResponse & response)
 {
     Poco::JSON::Object result;
     if (metadata_location)
         result.set("metadata-location", *metadata_location);
     result.set("metadata", metadata);
-    /// TODO: Add credential vending yet. For now, clients use their own storage credentials.
-    result.set("config", Poco::JSON::Object());
+
+    Poco::JSON::Object::Ptr config = new Poco::JSON::Object();
+    if (credentials)
+    {
+        for (const auto & [key, value] : credentials->config)
+            config->set(key, value);
+
+        /// New clients read `storage-credentials`. Old clients read `config`. Both get the same keys.
+        Poco::JSON::Object storage_credential;
+        storage_credential.set("prefix", credentials->prefix);
+        storage_credential.set("config", config);
+        Poco::JSON::Array storage_credentials;
+        storage_credentials.add(storage_credential);
+        result.set("storage-credentials", storage_credentials);
+    }
+    result.set("config", config);
     sendJSON(response, result, Poco::Net::HTTPResponse::HTTP_OK);
 }
 
@@ -840,7 +892,11 @@ void IcebergRESTCatalogHandler::handleTableExists(
 }
 
 void IcebergRESTCatalogHandler::handleLoadTable(
-    const IcebergRESTCatalogWarehouse & warehouse, const IcebergRESTRouteMatch & match, HTTPServerResponse & response) const
+    const IcebergRESTCatalogWarehouse & warehouse,
+    const IcebergRESTRouteMatch & match,
+    bool vend_credentials,
+    HTTPServerResponse & response,
+    const Context & context) const
 {
     const auto ns = getNamespaceOrSendNotFound(warehouse, match, response);
     if (!ns)
@@ -854,13 +910,20 @@ void IcebergRESTCatalogHandler::handleLoadTable(
         return;
     }
 
-    sendLoadTableResult(pointer->metadata_location, readTableMetadata(warehouse, *pointer), response);
+    const auto metadata = readTableMetadata(warehouse, *pointer);
+    /// A user who cannot commit gets credentials that cannot write.
+    /// TODO: Every user of the catalog gets credentials for every table of the warehouse. Review this when the catalog gets grants for tables.
+    const auto access = context.getSettingsRef()[Setting::readonly] ? IcebergRESTCatalogVendedAccess::ReadOnly : IcebergRESTCatalogVendedAccess::ReadWrite;
+    const auto credentials
+        = vendTableCredentials(warehouse, *ns, table, metadata->getValue<String>("location"), access, vend_credentials, context);
+    sendLoadTableResult(pointer->metadata_location, metadata, credentials, response);
 }
 
 void IcebergRESTCatalogHandler::handleCreateTable(
     const IcebergRESTCatalogWarehouse & warehouse,
     const IcebergRESTRouteMatch & match,
     const String & body,
+    bool vend_credentials,
     HTTPServerResponse & response,
     const Context & context) const
 {
@@ -957,10 +1020,17 @@ void IcebergRESTCatalogHandler::handleCreateTable(
                 fmt::format("Table already exists: {}.{}", joinNamespace(ns), name));
             return;
         }
+        /// The client writes the first data files with these credentials, then sends the create commit.
+        const auto credentials
+            = vendTableCredentials(warehouse, ns, name, location, IcebergRESTCatalogVendedAccess::ReadWrite, vend_credentials, context);
         LOG_INFO(log, "Staged table {}.{} at {}", joinNamespace(ns), name, location);
-        sendLoadTableResult(std::nullopt, metadata, response);
+        sendLoadTableResult(std::nullopt, metadata, credentials, response);
         return;
     }
+
+    /// Vend before the write, so that an STS error leaves no table behind.
+    const auto credentials
+        = vendTableCredentials(warehouse, ns, name, location, IcebergRESTCatalogVendedAccess::ReadWrite, vend_credentials, context);
 
     using CreateTableResult = IcebergRESTCatalogWarehouse::CreateTableResult;
     const auto created = writeAndRegisterTable(warehouse, ns, name, pointer, metadata, compression_method);
@@ -981,7 +1051,7 @@ void IcebergRESTCatalogHandler::handleCreateTable(
 
     LOG_INFO(log, "Created table {}.{} at {}", joinNamespace(ns), name, pointer.metadata_location);
     /// Answer from memory. The table is registered, so a failed read-back must not turn into a 500.
-    sendLoadTableResult(pointer.metadata_location, metadata, response);
+    sendLoadTableResult(pointer.metadata_location, metadata, credentials, response);
 }
 
 void IcebergRESTCatalogHandler::handleUpdateTable(

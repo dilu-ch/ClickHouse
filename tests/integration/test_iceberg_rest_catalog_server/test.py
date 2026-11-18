@@ -19,6 +19,7 @@ from pyiceberg.types import LongType, NestedField, StringType
 
 from helpers.cluster import ClickHouseCluster
 from helpers.config_cluster import minio_access_key, minio_secret_key
+from minio import Minio
 from test_storage_s3.test_sts import run_s3_mocks
 
 cluster = ClickHouseCluster(__file__)
@@ -398,6 +399,10 @@ def load_pyiceberg_catalog():
     )
 
 
+# The database has its own S3 keys, so it does not ask the catalog for credentials.
+# A debug build logs the load table response. The mock STS vends the MinIO password,
+# and the `Detect passwords in tests` rule aborts the server when the password is logged.
+# TODO: Test the ClickHouse client with vended credentials. It asks for them by default.
 def create_database_query():
     token = base64.b64encode(":".join(DEFAULT_AUTH).encode()).decode()
     return f"""
@@ -406,7 +411,7 @@ def create_database_query():
         CREATE DATABASE rest_tables_db
         ENGINE = DataLakeCatalog('http://localhost:{CATALOG_PORT}/v1', '{minio_access_key}', '{minio_secret_key}')
         SETTINGS catalog_type = 'rest', warehouse = 'my_warehouse',
-            storage_endpoint = 'http://minio1:9001/{BUCKET}',
+            storage_endpoint = 'http://minio1:9001/{BUCKET}', vended_credentials = 0,
             auth_header = 'Authorization: Basic {token}'
         """
 
@@ -847,7 +852,7 @@ def test_clickhouse_rest_catalog_client(started_cluster):
         CREATE DATABASE rest_client_db
         ENGINE = DataLakeCatalog('http://localhost:{CATALOG_PORT}/v1', '{minio_access_key}', '{minio_secret_key}')
         SETTINGS catalog_type = 'rest', warehouse = 'my_warehouse',
-            storage_endpoint = 'http://minio1:9001/{BUCKET}'
+            storage_endpoint = 'http://minio1:9001/{BUCKET}', vended_credentials = 0
         """)
     try:
         tables = node.query("SHOW TABLES FROM rest_client_db").splitlines()
@@ -886,7 +891,7 @@ def test_clickhouse_rest_catalog_client_location_not_a_uri(started_cluster):
         CREATE DATABASE rest_client_location_db
         ENGINE = DataLakeCatalog('http://localhost:{CATALOG_PORT}/v1', '{minio_access_key}', '{minio_secret_key}')
         SETTINGS catalog_type = 'rest', warehouse = 'my_warehouse',
-            storage_endpoint = 'http://minio1:9001/{BUCKET}'
+            storage_endpoint = 'http://minio1:9001/{BUCKET}', vended_credentials = 0
         """)
     try:
         for ns in directories:
@@ -909,7 +914,7 @@ def test_clickhouse_client_creates_table(started_cluster):
         CREATE DATABASE {db}
         ENGINE = DataLakeCatalog('http://localhost:{CATALOG_PORT}/v1', '{minio_access_key}', '{minio_secret_key}')
         SETTINGS catalog_type = 'rest', warehouse = 'my_warehouse',
-            storage_endpoint = 'http://minio1:9001/{BUCKET}'
+            storage_endpoint = 'http://minio1:9001/{BUCKET}', vended_credentials = 0
         """)
 
     def create_query(table, if_not_exists=False):
@@ -2145,3 +2150,86 @@ def test_pyiceberg_create_table_transaction(started_cluster):
         assert node.query(f"SELECT id, name FROM rest_tables_db.`{ns}.events` ORDER BY id") == "1\ta\n2\tb\n"
     finally:
         node.query("DROP DATABASE IF EXISTS rest_tables_db")
+
+
+VENDING_HEADERS = {"X-Iceberg-Access-Delegation": "vended-credentials"}
+
+
+def assert_vended_credentials(result, location):
+    config = result["config"]
+    # The mock STS hands out the MinIO keys. It returns no session token.
+    assert config["s3.access-key-id"] == minio_access_key
+    assert config["s3.secret-access-key"] == minio_secret_key
+    assert int(config["s3.session-token-expires-at-ms"]) > time.time() * 1000
+    assert result["storage-credentials"] == [{"prefix": location, "config": config}]
+
+
+# The mock STS ignores the session policy.
+# The test with real AWS verifies that the credentials are limited to the table.
+def test_vended_credentials(started_cluster):
+    ns = f"vended_{uuid.uuid4().hex[:8]}"
+    create_namespace([ns])
+    body = {"name": "events", "schema": DEFAULT_SCHEMA}
+
+    # The client asks for credentials on create, stage-create and load.
+    created = catalog_request("POST", tables_url(ns), json=body, headers=VENDING_HEADERS).json()
+    location = created["metadata"]["location"]
+    assert_vended_credentials(created, location)
+    # The server has no `vended_s3_endpoint`, so the client keeps its own endpoint.
+    assert "s3.endpoint" not in created["config"]
+    assert "s3.path-style-access" not in created["config"]
+
+    staged = catalog_request(
+        "POST", tables_url(ns), json={**body, "name": "staged", "stage-create": True}, headers=VENDING_HEADERS
+    ).json()
+    assert_vended_credentials(staged, staged["metadata"]["location"])
+
+    # The header is a list.
+    headers = {"X-Iceberg-Access-Delegation": "remote-signing, vended-credentials"}
+    loaded = catalog_request("GET", tables_url(ns, "events"), headers=headers).json()
+    assert_vended_credentials(loaded, location)
+    # The server keeps the credentials of a table and gives them out again.
+    assert loaded["config"] == created["config"]
+
+    # The credentials work.
+    client = Minio(
+        f"{cluster.minio_ip}:{cluster.minio_port}",
+        access_key=loaded["config"]["s3.access-key-id"],
+        secret_key=loaded["config"]["s3.secret-access-key"],
+        secure=False,
+    )
+    client.stat_object(BUCKET, metadata_key(loaded["metadata-location"]))
+
+    # A user who cannot write also gets credentials on load.
+    readonly_auth = ("readonly_user", "")
+    loaded = catalog_request("GET", tables_url(ns, "events"), headers=VENDING_HEADERS, auth=readonly_auth).json()
+    assert_vended_credentials(loaded, location)
+    response = catalog_request(
+        "POST", tables_url(ns), json={**body, "name": "forbidden"}, headers=VENDING_HEADERS, auth=readonly_auth, expected_code=403
+    )
+    assert_error_shape(response, "ForbiddenException")
+
+    # Without the header the server gives no credentials.
+    for result in [
+        catalog_request("GET", tables_url(ns, "events")).json(),
+        create_table(ns, "plain").json(),
+        stage_create_table(ns, "plain_staged").json(),
+    ]:
+        assert result["config"] == {}
+        assert "storage-credentials" not in result
+
+    # A commit response has no credentials.
+    committed = catalog_request(
+        "POST", tables_url(ns, "events"), json={"requirements": [], "updates": []}, headers=VENDING_HEADERS
+    ).json()
+    assert "config" not in committed
+    assert "storage-credentials" not in committed
+
+    # node_aux has `vended_s3_endpoint`. Its clients get the endpoint with the credentials.
+    ns_url = catalog_url("/v1/my_warehouse/namespaces", node_aux)
+    assert requests.post(ns_url, json={"namespace": [ns]}).status_code == 200
+    result = requests.post(catalog_url(tables_url(ns), node_aux), json=body, headers=VENDING_HEADERS)
+    assert result.status_code == 200, result.text
+    config = result.json()["config"]
+    assert config["s3.endpoint"] == "http://minio1:9001"
+    assert config["s3.path-style-access"] == "true"

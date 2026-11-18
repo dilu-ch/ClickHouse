@@ -12,6 +12,8 @@
 #if USE_AWS_S3
 #include <Disks/DiskObjectStorage/ObjectStorages/S3/S3ObjectStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/S3/diskSettings.h>
+#include <IO/S3/Client.h>
+#include <IO/S3/Credentials.h>
 #include <IO/S3/URI.h>
 #endif
 
@@ -28,9 +30,15 @@ namespace Setting
 
 namespace S3AuthSetting
 {
+    extern const S3AuthSettingsString access_key_id;
+    extern const S3AuthSettingsUInt64 expiration_window_seconds;
     extern const S3AuthSettingsString external_id;
     extern const S3AuthSettingsString role_arn;
     extern const S3AuthSettingsString role_session_name;
+    extern const S3AuthSettingsString secret_access_key;
+    extern const S3AuthSettingsString session_token;
+    extern const S3AuthSettingsBool use_environment_credentials;
+    extern const S3AuthSettingsBool use_insecure_imds_request;
 }
 #endif
 
@@ -59,9 +67,42 @@ S3Location parseS3Location(const String & location)
     return S3Location{.bucket = location.substr(S3_SCHEME.size(), slash - S3_SCHEME.size()), .key = location.substr(slash + 1)};
 }
 
-/// S3 client of the warehouse. It accesses the bucket with the warehouse credential.
+#if USE_AWS_S3
+/// STS client for credential vending. It signs with the identity of the server.
+/// The S3 client of the warehouse assumes the warehouse role with the same identity.
+/// TODO: This repeats the choice of the identity from `S3::ClientFactory::create`. Move it to a shared function in `IO/S3`.
+std::shared_ptr<S3::AWSAssumeRoleClient> createVendingSTSClient(const S3::Client & client, const S3::S3AuthSettings & auth_settings)
+{
+    Aws::Auth::AWSCredentials credentials(
+        Aws::String(auth_settings[S3AuthSetting::access_key_id].value),
+        Aws::String(auth_settings[S3AuthSetting::secret_access_key].value),
+        Aws::String(auth_settings[S3AuthSetting::session_token].value));
+
+    S3::CredentialsConfiguration base_configuration;
+    /// `S3::ClientFactory::create` makes the same choice for a client with a role.
+    base_configuration.use_environment_credentials = auth_settings[S3AuthSetting::use_environment_credentials] || credentials.IsEmpty();
+    base_configuration.use_insecure_imds_request = auth_settings[S3AuthSetting::use_insecure_imds_request];
+    base_configuration.expiration_window_seconds = auth_settings[S3AuthSetting::expiration_window_seconds];
+    /// The identity of the server signs only the STS call. S3 requests use the assumed role.
+    base_configuration.forbid_implicit_credentials = false;
+
+    auto client_configuration = client.getClientConfiguration();
+    /// STS requests are helper traffic. They are not the connection of a logged request.
+    client_configuration.publish_connection_info = false;
+    return S3::AWSAssumeRoleClient::create(
+        S3::getCredentialsProvider(client_configuration, credentials, base_configuration), client_configuration);
+}
+#endif
+
+struct WarehouseStorage
+{
+    ObjectStoragePtr object_storage;
+    IcebergRESTCatalogCredentialVendorPtr credential_vendor;
+};
+
+/// S3 client of the warehouse and the credential vendor. The client accesses the bucket with the warehouse credential.
 /// The endpoint comes from `url_scheme_mappers` in the server config, AWS by default.
-ObjectStoragePtr createObjectStorage([[maybe_unused]] ContextPtr context, [[maybe_unused]] const IcebergRESTCatalogWarehouseDefinition & definition)
+WarehouseStorage createStorage([[maybe_unused]] ContextPtr context, [[maybe_unused]] const IcebergRESTCatalogWarehouseDefinition & definition)
 {
 #if USE_AWS_S3
     const auto & credential = definition.credential;
@@ -83,7 +124,8 @@ ObjectStoragePtr createObjectStorage([[maybe_unused]] ContextPtr context, [[mayb
     s3_settings->auth_settings[S3AuthSetting::role_session_name] = credential.role_session_name;
 
     auto client = getClient(url, *s3_settings, context, /*for_disk_s3*/ false);
-    return std::make_shared<S3ObjectStorage>(
+    auto sts_client = createVendingSTSClient(*client, s3_settings->auth_settings);
+    auto object_storage = std::make_shared<S3ObjectStorage>(
         std::move(client),
         std::move(s3_settings),
         url,
@@ -93,6 +135,12 @@ ObjectStoragePtr createObjectStorage([[maybe_unused]] ContextPtr context, [[mayb
         /*for_disk_s3*/ false,
         /*credentials_refresh_callback*/ S3ObjectStorage::S3CredentialsRefreshCallback{},
         /*client_restricts_server_credentials*/ context->shouldRestrictUserQueryS3Credentials());
+    auto credential_vendor = std::make_shared<const IcebergRESTCatalogCredentialVendor>(
+        std::move(sts_client),
+        credential,
+        context->getConfigRef().getString("iceberg_rest_catalog.vended_s3_endpoint", ""),
+        object_storage->getS3StorageClient());
+    return WarehouseStorage{.object_storage = std::move(object_storage), .credential_vendor = std::move(credential_vendor)};
 #else
     throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "The Iceberg REST catalog needs S3 support, but this build has none");
 #endif
@@ -101,8 +149,16 @@ ObjectStoragePtr createObjectStorage([[maybe_unused]] ContextPtr context, [[mayb
 }
 
 IcebergRESTCatalogWarehouse::IcebergRESTCatalogWarehouse(
-    String name_, String base_location_, KeeperIcebergRESTCatalogStorePtr store_, ObjectStoragePtr object_storage_)
-    : name(std::move(name_)), base_location(std::move(base_location_)), object_storage(std::move(object_storage_)), store(std::move(store_))
+    String name_,
+    String base_location_,
+    KeeperIcebergRESTCatalogStorePtr store_,
+    ObjectStoragePtr object_storage_,
+    IcebergRESTCatalogCredentialVendorPtr credential_vendor_)
+    : name(std::move(name_))
+    , base_location(std::move(base_location_))
+    , object_storage(std::move(object_storage_))
+    , store(std::move(store_))
+    , credential_vendor(std::move(credential_vendor_))
 {
     /// The warehouse has one S3 client, bound to one bucket. Every location must be in that bucket.
     validateLocation(base_location);
@@ -198,6 +254,13 @@ IcebergRESTCatalogWarehouse::UpdateTablesResult IcebergRESTCatalogWarehouse::upd
     return store->updateTables(updates);
 }
 
+IcebergRESTCatalogVendedCredentials IcebergRESTCatalogWarehouse::vendCredentials(const String & location, IcebergRESTCatalogVendedAccess access) const
+{
+    auto parsed = parseS3Location(location);
+    validateLocation(parsed);
+    return credential_vendor->vend(location, parsed.bucket, parsed.key, access);
+}
+
 void IcebergRESTCatalogWarehouse::checkStorageAccess() const
 {
 #if USE_AWS_S3
@@ -229,8 +292,9 @@ IcebergRESTCatalogWarehousePtr createIcebergRESTCatalogWarehouse(
     auto store = std::make_shared<KeeperIcebergRESTCatalogStore>(
         [context, keeper_config] { return keeper_config.getZooKeeper(*context); },
         keeper_config.warehousePath(name) + "/" + toString(definition.uuid));
-    auto object_storage = createObjectStorage(context, definition);
-    return std::make_shared<const IcebergRESTCatalogWarehouse>(name, definition.base_location, std::move(store), std::move(object_storage));
+    auto storage = createStorage(context, definition);
+    return std::make_shared<const IcebergRESTCatalogWarehouse>(
+        name, definition.base_location, std::move(store), std::move(storage.object_storage), std::move(storage.credential_vendor));
 }
 
 }
