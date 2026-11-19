@@ -399,9 +399,7 @@ def load_pyiceberg_catalog():
     )
 
 
-# The database has its own S3 keys, so it does not ask the catalog for credentials.
-# A debug build logs the load table response. The mock STS vends the MinIO password,
-# and the `Detect passwords in tests` rule aborts the server when the password is logged.
+# `vended_credentials = 0` is needed to avoid logging the MinIO password on debug builds.
 # TODO: Test the ClickHouse client with vended credentials. It asks for them by default.
 def create_database_query():
     token = base64.b64encode(":".join(DEFAULT_AUTH).encode()).decode()
@@ -2164,8 +2162,7 @@ def assert_vended_credentials(result, location):
     assert result["storage-credentials"] == [{"prefix": location, "config": config}]
 
 
-# The mock STS ignores the session policy.
-# The test with real AWS verifies that the credentials are limited to the table.
+# The mock STS ignores the session policy, so this test does not check the table scope.
 def test_vended_credentials(started_cluster):
     ns = f"vended_{uuid.uuid4().hex[:8]}"
     create_namespace([ns])
